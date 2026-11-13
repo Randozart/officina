@@ -1,13 +1,34 @@
 # Officina — The Workshop Guide
 
 > *"The forge, the crucibles, the stills."* Officina is the interactive workshop
-> where the model is treated as a queryable database and every edit is a
-> composable operation. Type `GUIDE > topic` in the REPL to jump to a section.
+> where the model runs: sessions, models, gateway lanes and cloud routing,
+> driven from the Rust TUI (`officina`).
 
 ## Usage
 
 - **The prompt**: `┌──(☿ ALKA)-[model: …]-[context: …]-[drift: …]` then
   `└───> `. Telemetry blocks are toggled in `~/.vitriol/officina.toml`.
+- **Prompt history**: **↑/↓** step through earlier prompts (persisted at
+  `~/.vitriol/officina/input-history.jsonl`); stepping past the newest
+  entry restores your in-progress draft.
+- **Agent modes**: TAB cycles **BUILD → STEER → INQUIRE → PLAN**. STEER
+  (copper) applies a course correction to the work in flight and keeps
+  going. INQUIRE (green) answers and steers without acting — its replies
+  land in `/answers` (scrollable panel, also pinged after each turn).
+  PLAN is research-only (`*.md` writes); BUILD unlocks writes.
+- **Clarifying questions**: the model's question tool opens a real modal
+  (options + "Type something." free text) in every agent mode.
+- **Thinking display**: `/thinking-view hide|show` collapses thinking
+  blocks to a one-line marker (char count) or shows them again. Display
+  only — the model's thinking *level* remains pi's `/thinking`.
+- **Janitor**: `/janitor [dry]` removes stale runtime artifacts —
+  expired prompt suggestions, watchdog facts older than a day, finished
+  longjob logs (7 days / cap 50), probe reports (30 days), KV slot
+  mirrors (14 days, `slot0.bin` protected), and superseded session-chain
+  snapshots (7 days). Protections: the newest file of every session
+  store, base sessions, corrupt quarantines, ledgers, prefs, history.
+  Auto-runs once a day with a notice only when it removed something;
+  `OFFICINA_NO_JANITOR=1` disables.
 - **Model lanes** (`/model`): `officina/lapis` ("Lapis Occultus") is the
   local-first resilient default; `officina/nimbus` is the **cloud-only**
   lane — every turn routes to the best verified-FREE cloud model, the
@@ -23,8 +44,6 @@
   ⧉ bar under the prompt). BackTab still cycles tabs.
 - **Scroll**: **PgUp**/**PgDn** scroll the output; Up/Down recall command
   history; Enter runs a command.
-- **Grammar**: `[COMMIT … >] KEYWORD > target args`. Uppercase keywords first,
-  lowercase targets/args, `>` is the work conduit.
 
 ## Subscriptions via Caduceus
 
@@ -68,8 +87,8 @@ Check what is actually configured:
     vitriol caduceus preflight         # local/gateway/keys/keepalive/cooling
     vitriol caduceus stats --today     # route/token usage
 
-In the TUI: `/profile auto|fast|deep|local`, `/why`, `/free`, `/cost`,
-`/keys`, `/providers`.
+In the TUI: `/model-profile auto|fast|deep|local`, `/route-why`, `/free`,
+`/cost` (ledger) or `/budget` (usage), `/provider-keys`, `/provider-health`.
 
 Session safety:
 ```bash
@@ -126,71 +145,138 @@ Fixed egress only (no quota-based IP rotation):
 
 See `docs/OFFICINA.md` for cache-safe rules, Praetor budgets, and egress policy.
 
-## Probe vs Commit
+## Codex-inspired QoL
 
-Every mutating command runs as a **probe** by default — it shows the impact and
-changes nothing. Prefix with a commit to apply:
+- **/status** — session snapshot: model, agent mode, routing profile, ctx
+  fill, cwd, session, permissions, gateway lanes, routing policy.
+- **/review** — read-only review of `uncommitted` / `commit [ref]` /
+  `base [branch]` / a custom focus. The review turn cannot edit (write
+  tools are blocked); findings land in `.officina/review.json` and open in
+  **/review-findings** (severity-sorted, j/k, detail pane).
+- **Alt+E** — edit the composer draft in `$VISUAL`/`$EDITOR` (the TUI
+  suspends and restores; the draft is never lost).
+- **^o** — attach the clipboard image (Wayland `wl-paste` / X11 `xclip`,
+  magic-byte validated, 8 MiB / 4 images); ⎙N chip in the composer title;
+  **alt+o** clears. Images ride the next send as attachments.
+- **Resume filter** — type in `/resume` to narrow sessions by title/path.
+- **Composer predictions** — one muted "next step" line after a turn
+  (failing gates → fix; dirty tree → commit). `OFFICINA_NO_PREDICTIONS=1`
+  disables.
+- **Sandboxed mode** — a fourth permissions mode: bash runs in a bwrap box
+  (read-only filesystem, writable cwd + /tmp, no network unless
+  `OFFICINA_SANDBOX_NET=1`). bwrap missing → runs unwrapped with one
+  warning. ask/auto/yolo are untouched.
+- **/mode is gone** — the old alias shadowed typing `/model`; agent modes
+  live at `/agent` (the legacy `/mode plan` widget format still parses).
 
-- `COMMIT overwrite >` — modify the active model/mask in place.
-- `COMMIT as "name" >` — write a new target, base untouched.
-- Bare `COMMIT >` on a base-destructive op is **blocked** (safety contract).
-  Artifact ops (COMPILE, grimoires) keep bare `COMMIT >`.
+## Headless, cost, and automation
 
-## Diagnose
+- **Voice suggestions** — after a turn, the empty composer shows a dimmed
+  **ghost text** of your likely next prompt in your own phrasing. **→**
+  accepts it into the draft; typing or Esc dismisses; nothing is ever
+  pre-sent. It learns: accepted suggestions and privacy-screened recent
+  prompts are distilled into a voice profile (`voice-profile.json`) that
+  shapes future suggestions. Sensitive prompts never leave the box.
+  `OFFICINA_NO_PROMPT_SUGGEST=1` stops staging; `OFFICINA_NO_VOICE_LEARN=1`
+  freezes the profile.
+- **Liveness evidence** — the running-tool row shows `· cpu +3.2s`
+  (green): real CPU seconds burned by the tool's process tree in the last
+  sample window, straight from /proc. `cpu flat 120s` (amber) means the
+  subtree has consumed nothing — that's a true hang, not a quiet compile.
+- **Working indicator** — the header and transcript tail show an animated
+  braille spinner + elapsed seconds while a turn runs, on any lane
+  (local, cloud, hybrid — the spinner runs on stream evidence). When
+  activity goes quiet mid-turn it switches to muted `working… · stalled
+  Ns` instead of pretending. Quitting mid-turn arms a 5 s confirm.
+- **No-hang bash (longjob)** — known long-runner commands (cargo, make,
+  brievc, npm, pytest, go, …) are **auto-dispatched** instead of blocking:
+  the tool returns a job id + log path in ~50 ms; the agent polls
+  `bg_status`, waits bounded with `bg_wait`, or ends its turn — and is
+  woken with the result when the job finishes. Append `#fg` to force
+  foreground; `OFFICINA_NO_AUTOBG=1` restores blocking behaviour.
+- **/engine + Vitriol tab** — `vitriol-server.service` control from inside
+  the TUI: `/engine [start|stop|restart|status]`, or the **Vitriol** tab on
+  the caduceus page (unit state, pid, since, last journal line; **S**/X/R
+  start/stop/restart with press-twice confirmation). No sudo — the polkit
+  rule scopes you to the two vitriol units. Your daily-driver config is
+  untouched: the unit runs the live config; profile changes stay with
+  `vitriol config load <name>`.
+- **Hang watchdog** — long bash calls that stop producing output get a
+  notice at 60 s (`OFFICINA_HANG_SOFT_S`), and at 180 s
+  (`OFFICINA_HANG_JUDGE_S`) the session asks a FREE cloud lane to judge
+  liveliness. Verdicts render as a structured card (cmd / elapsed /
+  stalled / reason, verdict chip) and the running-tool row carries a
+  `watch Ns` countdown to the next check — silence with visible feedback.
+  It NEVER kills or aborts; Esc remains the only abort. Re-judges every
+  5 min, max 3 per call. `OFFICINA_NO_HANG_WATCHDOG=1` disables.
+- **/fx** — fire + glimmer panel with a live preview. `/fire` and
+  `/glimmer` are gone. Fire obeys the liveliness contract: it only burns
+  while the session is actually working (streaming text or live tool
+  CPU); when stalled the flames die and the preview says so. Glimmer
+  stays decorative on a fresh screen.
+## Headless, cost, and automation
 
-- `DESCRIBE > model` — aggregate census: arch, layers, experts, tensors, size.
-- `DESCRIBE > layer.12` / `layer.12.mlp` — per-tensor catalog (quant, size).
-- `CENSUS > layer.12` — W0 value census: dead-lane %, entropy, magnitude
-  (decodes f32/f16/q8_0/q4_0; other types reported unsupported).
-- `MAP` — real system memory: VRAM, host RAM, Hermetis, context, decode t/s.
-- `TEST > "prompt"` — run a prompt through the active model and syntax-check.
+- **`vitriol officina exec "task"`** — one-shot run through the full
+  harness (same extensions, lanes, prefs, permissions as the TUI).
+  `--lane auto|lapis|nimbus`, `--max-minutes N` (default 30, hard kill),
+  `--json`, `--tools csv`, `--no-trust`. `--detach` runs it in the
+  background with a log under `~/.local/share/officina/exec/` and a
+  desktop ping on completion; `--list` shows every run. Exec always uses
+  a FRESH session — it can never touch your store's sessions.
+- **/sessions** — search sessions across EVERY project store. Enter
+  resumes only this project's rows; foreign rows print `cd <proj> &&
+  officina` (read-only by contract).
+- **/cost** — today's route ledger: requests, tokens in/out, failures per
+  provider/model, day/month budget bars. Euro only when the ledger itself
+  priced the route.
+- **/fix-loop [N]** — verify → fix → re-verify, up to N rounds (default 3,
+  max 10, 6/day). Any manual input disarms it. With
+  `OFFICINA_FIXLOOP_AUTOCOMMIT=1` it commits the green tree automatically.
+- **Backups** — `scripts/officina-backup.sh` snapshots the session store
+  nightly (systemd user timer 04:00, 14-day retention); restore = manual
+  rsync from `~/.local/share/officina-backups/sessions/<date>/`.
+- **Desktop notifications** — long turns (≥20 s) ping via notify-send;
+  `OFFICINA_NO_DESKTOP_NOTIFY=1` disables.
+- **GitHub tools** — when origin is a GitHub remote, `gh_pr_list`,
+  `gh_pr_view`, `gh_pr_diff`, `gh_issue_list`, `gh_ci_status` give the
+  model structured read-only repo access (auth via your gh keyring).
 
-## Rectify (masks)
+## Caduceus page
 
-`RECTIFY` tallies which MoE experts actually fire for your workload and stores
-the result in a **named mask** — an auditable, versioned list of transactions.
+`/caduceus` opens the gateway page (full-screen, four tabs):
 
-- `RECTIFY > "prompt" into my_mask` — run a generation, record the fired
-  experts into `my_mask` (live data needs the fork's expert-activity hook).
-- `DESCRIBE > model my_mask` — census: active %, dross, estimated savings.
-- `LOG > model my_mask` — the transaction history.
-- `REVERT > model my_mask 2` — probe shows the impact; `COMMIT overwrite >`
-  surgically drops transaction 2.
-- `DISCARD > model my_mask` — delete the mask.
-- The right-hand **Spagyric Journal** `[MASKS]` panel lists every mask live.
+- **Providers** — every account plus the OAuth registry: routing on/off,
+  rank, key presence, gateway bucket, free model count, signup method.
+  `space` toggles routing, `+`/`-` rank, `enter` detail, `r` reload.
+- **Models** — tool-capable lanes with derived free/paid flags.
+  `space` cycles pin → deny → neutral, `/` filters, `h` hides the selected
+  model (display only — routing is untouched) and `H` shows hidden rows.
+- **Health** — gateway reachability, catalog freshness, budget, cooling,
+  connection buckets (read-only).
+- **Policy** — `free_only`, per-owner cap, max candidates, per-provider
+  `allow paid`. `space` toggles, `+`/`-` adjusts.
 
-## Ascensus
+Facts come from `~/.vitriol/officina/caduceus-state.json` (written by the
+caduceus extension every 60 s). Policy lives in
+`~/.vitriol/officina/caduceus-prefs.json`, written by the TUI and honoured
+by the routers on the next candidate-pool rebuild — no restart needed.
 
-- `ASCENSUS > RECTIFY > "specialize in Vulkan shaders" 50 into vulkan_shaders`
-  — the cloud model writes 50 calibration prompts, then they run locally as a
-  batch to populate the mask in minutes. Needs a Gemini key set in the
-  SUBSYSTEMS tab (`~/.vitriol/secrets`).
+Free-ness is derived from gateway pricing and the costless-owner list; the
+page only ever toggles policy. Removing prefs (or a corrupt file) restores
+the default routing exactly; the page footer says when prefs were ignored.
 
-## Grimoires
+Adding a provider:
 
-- `RECORD > "sys-opt"` — begin capturing committed ops.
-- `STOP` — write `~/.vitriol/grimoires/sys-opt.grimoire` (plain SPQL text,
-  git-trackable).
-- `PLAY > "sys-opt"` — probe lists the recipe; `COMMIT > PLAY` runs it.
+- `a` — quick key: an extension dialog asks for the key (visible while
+  typing), writes the env file, enables the account and syncs the gateway.
+- `A` — hidden-entry signup wizard: the TUI suspends,
+  `vitriol caduceus signup --only <provider>` runs, then the TUI resumes.
+- `o` — OAuth providers: suspend and run
+  `vitriol caduceus accounts oauth login <id>`; API-key providers open
+  their signup page.
 
-## Compile
-
-- `COMPILE > "name"` — package a `.spagyr` bundle (grimoire ref + model
-  fingerprint + profile). Probe by default; `COMMIT >` writes it.
-- A real AOT backend (Spagyric) is planned.
-
-## Weight surgery
-
-- `DISSOLVE > layer.12.mlp wanda 0.35` — weight pruning.
-- `COAGULATE > layer.12 norm into mlp` — fold a normalizer into the weights.
-- Both need the offline-rewrite backend (P3) — until then they report it is
-  not built yet. When live, `COMMIT as "name" > DISSOLVE > model <mask>` writes
-  a pruned variant.
-
-## Undo
-
-- `UNDO` reverts the last committed journal entry. Mask edits are versioned:
-  `REVERT` on a mask is always exact.
+Accounts remain gateway state (`vitriol caduceus accounts … --sync`); the
+TUI only changes routing preferences.
 
 ## Running multiple sessions
 

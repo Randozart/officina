@@ -47,6 +47,8 @@ fn mode_chip(label: &str) -> Option<(&'static str, ratatui::style::Color)> {
     match label.to_ascii_uppercase().as_str() {
         "PLAN" => Some(("☽", theme::SILVER)),
         "BUILD" => Some(("☉", theme::GOLD)),
+        "INQUIRE" => Some(("?", theme::GREEN)),
+        "STEER" => Some(("↝", theme::ORANGE)),
         _ => None,
     }
 }
@@ -75,21 +77,35 @@ fn mode_spans(
 /// the chip lives above the prompt box, not in the header). None until the
 /// agent-mode widget reports in → titleless border.
 fn composer_title(state: &AppState) -> Option<Vec<Span<'static>>> {
-    let label = state.agent_mode_label.as_deref()?;
-    if label.is_empty() {
-        return None;
+    let mut pending_chip: Option<Vec<Span<'static>>> = None;
+    if !state.pending_images.is_empty() {
+        pending_chip = Some(vec![Span::styled(
+            format!(" ⎙{}", state.pending_images.len()),
+            Style::new().fg(theme::GOLD).bg(theme::PANEL),
+        )]);
     }
-    match mode_chip(label) {
-        Some((symbol, color)) => Some(mode_spans(symbol, label, color, theme::PANEL)),
+    let Some(label) = state.agent_mode_label.as_deref() else {
+        // No agent chip yet — the image chip alone still deserves the title.
+        return pending_chip;
+    };
+    if label.is_empty() {
+        return pending_chip;
+    }
+    let mut spans = match mode_chip(label) {
+        Some((symbol, color)) => mode_spans(symbol, label, color, theme::PANEL),
         // Custom mode: the widget's own badge glyph, gold chip.
         None => {
             let glyph = state
                 .agent_mode_glyph
                 .clone()
                 .unwrap_or_else(|| theme::GLYPH_VITRIOL.to_string());
-            Some(mode_spans(&glyph, label, theme::GOLD, theme::PANEL))
+            mode_spans(&glyph, label, theme::GOLD, theme::PANEL)
         }
+    };
+    if let Some(mut chip) = pending_chip {
+        spans.append(&mut chip);
     }
+    Some(spans)
 }
 
 /// `/home/<user>/…` → `~/…` (the sidebar's old convention, moved to the
@@ -160,12 +176,33 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut left = vec![Span::styled("🜖 VITRIOL·OFFICINA", theme::banner())];
     if state.is_streaming {
         // Light yellow, the informational voice (owner request 2026-09-02):
-        // same tint the engine TUI uses for "prompt-eval …" — the process
-        // is moving. Orange stays reserved for genuine warnings.
-        left.push(Span::styled(
-            format!("  {} working", theme::GLYPH_FIRE),
-            theme::info(),
-        ));
+        // same tint the engine TUI uses for "prompt-eval …". Animated with
+        // a braille spinner on real activity (any lane — local or cloud);
+        // when evidence goes quiet the label says so instead of lying.
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let f = (state.started.elapsed().as_millis() / 120) as usize % frames.len();
+        if state.liveliness_active() {
+            left.push(Span::styled(
+                format!("  {} {} working {}", theme::GLYPH_FIRE, frames[f], {
+                    let secs = state.turn_elapsed_secs();
+                    if secs > 0 {
+                        format!("{secs}s")
+                    } else {
+                        String::new()
+                    }
+                }),
+                theme::info(),
+            ));
+        } else {
+            left.push(Span::styled(
+                format!(
+                    "  {} working · stalled {}s",
+                    theme::GLYPH_FIRE,
+                    state.stalled_secs()
+                ),
+                Style::new().fg(theme::MUTED),
+            ));
+        }
     }
 
     let model = state
@@ -285,6 +322,40 @@ fn render_main(frame: &mut Frame, state: &mut AppState, area: Rect) {
         render_cache_modal(frame, state, area);
         return;
     }
+    if state.fx_open {
+        render_chat_and_editor(frame, state, area);
+        render_fx_modal(frame, state, area);
+        return;
+    }
+    if state.answers_open {
+        render_chat_and_editor(frame, state, area);
+        render_answers_modal(frame, state, area);
+        return;
+    }
+    if state.cost_open {
+        render_chat_and_editor(frame, state, area);
+        render_cost_modal(frame, state, area);
+        return;
+    }
+    if state.xsessions_open {
+        render_chat_and_editor(frame, state, area);
+        render_xsessions_modal(frame, state, area);
+        return;
+    }
+    if state.review_open {
+        render_chat_and_editor(frame, state, area);
+        render_review_modal(frame, state, area);
+        return;
+    }
+    if state.status_open {
+        render_chat_and_editor(frame, state, area);
+        render_status_modal(frame, state, area);
+        return;
+    }
+    if state.caduceus.is_some() {
+        render_caduceus_page(frame, state, area);
+        return;
+    }
     if state.tools_modal_open {
         render_chat_and_editor(frame, state, area);
         render_tools_modal(frame, state, area);
@@ -385,14 +456,35 @@ fn render_chat_and_editor(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let mut lines = state.chat_lines(chat_width);
 
     if state.is_streaming {
+        // Animated spinner + elapsed seconds (2026-11-13): works on ANY
+        // lane — the spinner runs on stream evidence, so cloud turns
+        // animate exactly like local ones. Stalled → muted, says so.
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let f = (state.started.elapsed().as_millis() / 120) as usize % frames.len();
+        let (style, suffix) = if state.liveliness_active() {
+            let secs = state.turn_elapsed_secs();
+            (
+                theme::info(),
+                if secs > 0 {
+                    format!(" {secs}s")
+                } else {
+                    String::new()
+                },
+            )
+        } else {
+            (
+                Style::new().fg(theme::MUTED),
+                format!(" · stalled {}s", state.stalled_secs()),
+            )
+        };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{} ", theme::GLYPH_AI),
+                format!("{} {} ", theme::GLYPH_AI, frames[f]),
                 Style::default().fg(theme::GOLD).bg(theme::BG),
             ),
             // Light yellow to match the header (owner request 2026-09-02 —
             // the informational voice, like the engine TUI's prompt-eval).
-            Span::styled("working…", theme::info()),
+            Span::styled(format!("working…{suffix}"), style),
         ]));
     }
     if state.is_compacting {
@@ -681,7 +773,34 @@ fn render_chat_and_editor(frame: &mut Frame, state: &mut AppState, area: Rect) {
     frame.render_widget(input_block, input_area);
 
     let prompt = Span::styled("> ", Style::default().fg(theme::GREEN).bg(theme::PANEL));
-    let line = if state.input.is_empty() {
+    let line = if state.input.is_empty() && state.prompt_ghost.is_some() {
+        // Voice-suggestion ghost (stage 2): dimmed gold, cursor block on the
+        // first glyph — same shape as the motto, but a suggestion you can
+        // accept with →. Render-only; nothing is ever pre-sent (I1).
+        let ghost = state.prompt_ghost.as_ref().unwrap();
+        let budget = (inner.width as usize).saturating_sub(2);
+        let text: String = ghost.text.chars().take(budget).collect();
+        let mut chars = text.chars();
+        let first = chars.next().unwrap_or(' ');
+        let rest: String = chars.collect();
+        Line::from(vec![
+            prompt,
+            Span::styled(
+                first.to_string(),
+                Style::default()
+                    .fg(theme::GOLD)
+                    .bg(theme::PANEL)
+                    .add_modifier(Modifier::REVERSED | Modifier::DIM),
+            ),
+            Span::styled(
+                rest,
+                Style::default()
+                    .fg(theme::GOLD)
+                    .bg(theme::PANEL)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ])
+    } else if state.input.is_empty() {
         // Carved motto placeholder (owner request 2026-09-03) — the cursor
         // block sits ON the first letter, the rest fades into the panel.
         let budget = (inner.width as usize).saturating_sub(2); // "> " prompt
@@ -1263,23 +1382,41 @@ fn render_resume_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
             Style::new().fg(theme::GOLD).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Span::styled(
-            " ↑↓ select · enter resume · esc cancel ",
+            if state.resume_filter.is_empty() {
+                " ↑↓ select · enter resume · type to filter · esc cancel ".to_string()
+            } else {
+                format!(" /{} _ · ↑↓ · enter · esc clears ", state.resume_filter)
+            },
             Style::new().fg(theme::MUTED),
         ));
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
     let visible = inner.height as usize;
+    let filtered = state.filtered_resume_entries();
     let sel = state.resume_sel;
     let skip = if sel + 1 > visible {
         sel + 1 - visible
     } else {
         0
     };
-    let entries = &state.resume_entries[skip.min(state.resume_entries.len())..];
 
     let mut lines: Vec<Line> = Vec::new();
-    for (i, e) in entries.iter().enumerate() {
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if state.resume_filter.is_empty() {
+                "  no sessions".to_string()
+            } else {
+                format!("  no sessions match '{}'", state.resume_filter)
+            },
+            Style::new().fg(theme::MUTED),
+        )));
+    }
+    let window: Vec<_> = filtered
+        .into_iter()
+        .skip(skip.min(state.resume_entries.len()))
+        .collect();
+    for (i, e) in window.iter().enumerate() {
         let absolute = skip + i;
         let when = e
             .modified
@@ -1567,9 +1704,1250 @@ fn render_tree_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
     );
 }
 
-/// /cache manager — engine KV disk cache entries, newest first, with age and
-/// size. `d` deletes the highlighted entry, `w` wipes every non-protected
-/// entry, `r` re-scans. slot0.bin (warm-boot restore) is protected.
+/// /fx (2026-11-13) — fire + glimmer controls with a LIVE preview. The
+/// preview obeys the liveliness contract: when the session is stalled the
+/// fire preview disappears and says so (no decorative lie).
+fn render_fx_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let w = area.width.min(76);
+    let h = 16u16.min(area.height);
+    let modal = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, modal);
+    let active = state.liveliness_active();
+    let chip = if active {
+        format!(" ACTIVE · streaming {}s ", state.stalled_secs())
+    } else {
+        format!(" STALLED · {}s ", state.stalled_secs())
+    };
+    let chip_style = if active {
+        Style::new().fg(theme::GREEN).bg(theme::PANEL)
+    } else {
+        Style::new().fg(theme::ORANGE).bg(theme::PANEL)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::GOLD).bg(theme::PANEL))
+        .title(Span::styled(
+            format!(" {} fx ", theme::GLYPH_SULFUR),
+            Style::new()
+                .fg(theme::GOLD)
+                .bg(theme::PANEL)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(chip, chip_style))
+        .style(Style::new().bg(theme::PANEL));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height < 8 || inner.width < 40 {
+        return;
+    }
+    let chunks = Layout::vertical([
+        Constraint::Length(5), // rows
+        Constraint::Length(2), // preview
+        Constraint::Length(2), // status/help
+    ])
+    .split(inner);
+
+    let rows = [
+        ("fire", if state.fire_on { "on" } else { "off" }.to_string()),
+        ("voice", state.fire_style.label().to_string()),
+        (
+            "tint",
+            if state.fire_tint { "on" } else { "off" }.to_string(),
+        ),
+        ("glimmer", state.glimmer.label().to_string()),
+    ];
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let sel = i == state.fx_sel;
+        let marker = if sel { "▸" } else { " " };
+        let text = format!(
+            " {marker} {label:<10} {value}",
+            label = label,
+            value = value
+        );
+        let style = if sel {
+            Style::new().fg(theme::BG).bg(theme::GOLD)
+        } else {
+            Style::new().fg(theme::TEXT).bg(theme::PANEL)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(theme::PANEL)),
+        chunks[0],
+    );
+
+    // Live preview: animated fire strip (only when armed AND active) plus a
+    // shimmer sample for the selected glimmer mode.
+    let phase = state.started.elapsed().as_millis();
+    let preview = chunks[1];
+    if state.fire_on && active && preview.height >= 1 {
+        let level = 0.55 + 0.25 * ((phase as f64 / 900.0).sin().abs());
+        crate::fire::render(
+            frame,
+            Rect {
+                x: preview.x + 1,
+                y: preview.y,
+                width: preview.width.saturating_sub(2),
+                height: preview.height.min(2),
+            },
+            phase,
+            level,
+            state.fire_style,
+        );
+    } else {
+        let msg = if state.fire_on {
+            format!(
+                " fire preview hidden — stalled {}s (no stream, no tool CPU)",
+                state.stalled_secs()
+            )
+        } else {
+            " fire off".to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            ))),
+            Rect {
+                height: 1,
+                ..preview
+            },
+        );
+    }
+    // Glimmer sample: phase-driven shimmer glyphs (decorative by design).
+    if state.glimmer != crate::watermark::GlimmerMode::Off {
+        let t = (phase as f64 / 500.0).sin() * 0.5 + 0.5;
+        let pulse = Style::new()
+            .fg(theme::GOLD)
+            .bg(theme::PANEL)
+            .add_modifier(if t > 0.6 {
+                Modifier::BOLD
+            } else {
+                Modifier::DIM
+            });
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" ⌁ ", Style::new().fg(theme::MUTED).bg(theme::PANEL)),
+                Span::styled(format!("{} ⣀⣤⣶⣿⣶⣤⣀", state.glimmer.label()), pulse),
+            ])),
+            Rect {
+                height: 1,
+                y: preview.y + preview.height.saturating_sub(1),
+                ..preview
+            },
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                " ↑↓ row · space/←→ cycle · esc close",
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            )),
+            Line::from(Span::styled(
+                " fire follows the liveliness contract: no evidence → no flames",
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            )),
+        ])
+        .style(Style::new().bg(theme::PANEL)),
+        chunks[2],
+    );
+}
+
+/// /answers (2026-11-13) — the last INQUIRE-mode question + answer, wrapped
+/// and scrollable. Read-only facts-file view.
+fn render_answers_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let h = area.height.min(area.height.saturating_sub(2)).max(8);
+    let w = area.width.min(96);
+    let modal = Rect {
+        y: area.y,
+        x: area.x,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::GOLD).bg(theme::PANEL))
+        .title(Span::styled(
+            format!(" {} inquire · answer ", theme::GLYPH_HERM),
+            Style::new()
+                .fg(theme::GOLD)
+                .bg(theme::PANEL)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            " ↑↓ scroll · r reload · esc close ",
+            Style::new().fg(theme::MUTED).bg(theme::PANEL),
+        ))
+        .style(Style::new().bg(theme::PANEL));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height < 2 || inner.width < 20 {
+        return;
+    }
+    let Some(doc) = state.answers.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  no inquiry answer yet — switch to INQUIRE (TAB) and ask a question",
+                    Style::new().fg(theme::ORANGE).bg(theme::PANEL),
+                )),
+                Line::from(Span::styled(
+                    "  the answer lands here without interrupting the build flow",
+                    Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  Q  ", Style::new().fg(theme::GOLD).bg(theme::PANEL)),
+        Span::styled(
+            trunc(&doc.question, inner.width.saturating_sub(6) as usize),
+            Style::new().fg(theme::TEXT).bg(theme::PANEL),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    let body_w = inner.width.saturating_sub(6) as usize;
+    for para_line in doc.answer.lines() {
+        for seg in crate::tui::state::wrap_text(para_line, body_w) {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::new().bg(theme::PANEL)),
+                Span::styled(seg, Style::new().fg(theme::TEXT).bg(theme::PANEL)),
+            ]));
+        }
+    }
+    let visible = inner.height as usize;
+    let start = (state.answers_scroll as usize).min(lines.len().saturating_sub(1));
+    let window: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
+    frame.render_widget(
+        Paragraph::new(window).style(Style::new().bg(theme::PANEL)),
+        inner,
+    );
+}
+
+/// /cost (exec-infra stage 5) — today's route ledger + budget bars.
+/// Euro appears only when the ledger itself carried costEstimate (I5).
+fn render_cost_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let h = area.height.min(30);
+    let w = area.width.min(96);
+    let modal = Rect {
+        y: area.y + area.height.saturating_sub(h + 1),
+        x: area.x,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, modal);
+    let day = state
+        .cost
+        .as_ref()
+        .map(|r| r.day.clone())
+        .unwrap_or_else(|| "—".to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::GOLD).bg(theme::PANEL))
+        .title(Span::styled(
+            format!(" {} cost · route ledger {day} ", theme::GLYPH_HERM),
+            Style::new()
+                .fg(theme::GOLD)
+                .bg(theme::PANEL)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(theme::PANEL));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.width < 50 || inner.height < 4 {
+        return;
+    }
+    let Some(report) = state.cost.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  no ledger data",
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            ))),
+            inner,
+        );
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    if report.budget_present {
+        let bar = |frac: f32| {
+            let filled = (frac * 20.0).round() as usize;
+            let mut s = String::from("[");
+            for i in 0..20 {
+                s.push(if i < filled { '#' } else { '.' });
+            }
+            s.push(']');
+            s
+        };
+        let style = |frac: f32| {
+            if frac >= 1.0 {
+                Style::new().fg(theme::RED).bg(theme::PANEL)
+            } else if frac >= 0.8 {
+                Style::new().fg(theme::ORANGE).bg(theme::PANEL)
+            } else {
+                Style::new().fg(theme::GREEN).bg(theme::PANEL)
+            }
+        };
+        let df = report.daily_fraction();
+        let mf = report.monthly_fraction();
+        lines.push(Line::from(vec![
+            Span::styled("  day    ", Style::new().fg(theme::MUTED).bg(theme::PANEL)),
+            Span::styled(bar(df), style(df)),
+            Span::styled(
+                format!(
+                    " {} / {} ({})",
+                    crate::tui::caduceus::fmt_count(report.budget_daily_tokens),
+                    crate::tui::caduceus::fmt_count(report.budget_daily_cap),
+                    if report.budget_allowed {
+                        "open"
+                    } else {
+                        "EXHAUSTED"
+                    }
+                ),
+                Style::new().fg(theme::TEXT).bg(theme::PANEL),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  month  ", Style::new().fg(theme::MUTED).bg(theme::PANEL)),
+            Span::styled(bar(mf), style(mf)),
+            Span::styled(
+                format!(
+                    " {} / {}",
+                    crate::tui::caduceus::fmt_count(report.budget_monthly_tokens),
+                    crate::tui::caduceus::fmt_count(report.budget_monthly_cap)
+                ),
+                Style::new().fg(theme::TEXT).bg(theme::PANEL),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {:<44} {:>8} {:>6} {:>10} {:>10}",
+            "provider/model", "reqs", "fails", "tok in", "tok out"
+        ),
+        Style::new().fg(theme::MUTED).bg(theme::PANEL),
+    )));
+    let budget_h: usize = if report.budget_present { 3 } else { 1 };
+    let visible = (inner.height - (budget_h as u16 + 1)) as usize;
+    for row in report.rows.iter().take(visible) {
+        let fail_style = if row.failures > 0 {
+            Style::new().fg(theme::ORANGE).bg(theme::PANEL)
+        } else {
+            Style::new().fg(theme::TEXT).bg(theme::PANEL)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<44} {:>8}", trunc(&row.key, 44), row.requests),
+                Style::new().fg(theme::TEXT).bg(theme::PANEL),
+            ),
+            Span::styled(format!(" {:>6}", row.failures), fail_style),
+            Span::styled(
+                format!(
+                    " {:>10} {:>10}",
+                    crate::tui::caduceus::fmt_count(row.tokens_in),
+                    crate::tui::caduceus::fmt_count(row.tokens_out)
+                ),
+                Style::new().fg(theme::TEXT).bg(theme::PANEL),
+            ),
+        ]));
+    }
+    if report.rows.len() > visible {
+        lines.push(Line::from(Span::styled(
+            format!("  … {} more models", report.rows.len() - visible),
+            Style::new().fg(theme::MUTED).bg(theme::PANEL),
+        )));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(
+                "  total: {} in · {} out",
+                crate::tui::caduceus::fmt_count(report.total_in),
+                crate::tui::caduceus::fmt_count(report.total_out)
+            ),
+            Style::new().fg(theme::GOLD).bg(theme::PANEL),
+        ),
+        Span::styled(
+            if report.total_cost > 0.0 {
+                format!(" · €{:.4}", report.total_cost)
+            } else {
+                String::new()
+            },
+            Style::new().fg(theme::GOLD).bg(theme::PANEL),
+        ),
+    ]));
+    lines.truncate(inner.height as usize);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(theme::PANEL)),
+        inner,
+    );
+}
+
+/// /sessions (exec-infra stage 4) — every project store, newest first.
+/// Foreign projects render READ-ONLY: enter prints the launch hint (I4).
+fn render_xsessions_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let view = state.xsessions_view();
+    let h = area.height.min((view.len() as u16 + 3).clamp(8, 26));
+    let w = area.width.min(104);
+    let modal = Rect {
+        y: area.y + area.height.saturating_sub(h + 1),
+        x: area.x,
+        width: w,
+        height: h,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::GOLD))
+        .style(Style::new().bg(theme::PANEL))
+        .title(Span::styled(
+            " sessions · all projects ",
+            Style::new().fg(theme::GOLD).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            if state.xsessions_filter.is_empty() {
+                " ↑↓ select · enter resume/local · type to filter · esc cancel ".to_string()
+            } else {
+                format!(" /{} _ · ↑↓ · enter · esc clears ", state.xsessions_filter)
+            },
+            Style::new().fg(theme::MUTED),
+        ));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let visible = inner.height as usize;
+    let sel = state.xsessions_sel;
+    let skip = if sel + 1 > visible {
+        sel + 1 - visible
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    if view.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if state.xsessions_filter.is_empty() {
+                "  no sessions in any store".to_string()
+            } else {
+                format!("  nothing matches '{}'", state.xsessions_filter)
+            },
+            Style::new().fg(theme::MUTED),
+        )));
+    }
+    let cwd_str = state.cwd.to_string_lossy().to_string();
+    let window: Vec<_> = view.into_iter().skip(skip).collect();
+    for (i, a) in window.iter().enumerate() {
+        let selected = skip + i == sel;
+        let marker = if selected { "▸" } else { " " };
+        let project = if a.project == cwd_str {
+            "this project".to_string()
+        } else {
+            shorten_home(std::path::Path::new(&a.project))
+        };
+        let age = caduceus_age(
+            std::time::SystemTime::now()
+                .duration_since(a.entry.modified)
+                .unwrap_or_default(),
+        );
+        let foreign = if a.project == cwd_str { "" } else { " · ro" };
+        let text = format!(
+            " {} {:<28} {:<44} {:>5}msg {:>7}{foreign}",
+            marker,
+            trunc(&project, 28),
+            trunc(&a.entry.title, 44),
+            a.entry.msg_count,
+            age
+        );
+        let style = if selected {
+            Style::new().fg(theme::BG).bg(theme::GOLD)
+        } else if a.project == cwd_str {
+            Style::new().fg(theme::TEXT).bg(theme::PANEL)
+        } else {
+            Style::new().fg(theme::MUTED).bg(theme::PANEL)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    let body: Vec<Line> = lines.into_iter().skip(0).take(visible).collect();
+    frame.render_widget(
+        Paragraph::new(body).style(Style::new().bg(theme::PANEL)),
+        inner,
+    );
+}
+
+fn caduceus_age(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3_600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3_600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+/// /review-findings (codex-qol stage 7) — severity-colored findings from
+/// .officina/review.json. Read-only; honest hint when nothing was reviewed.
+fn render_review_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    use crate::tui::review::Finding;
+    let rows = state.review_rows();
+    let detail_h = if rows.is_empty() { 0 } else { 5 };
+    let h = area
+        .height
+        .min((rows.len() as u16 + 7 + detail_h).clamp(8, 30));
+    let w = area.width.min(92);
+    let modal = Rect {
+        y: area.y + area.height.saturating_sub(h + 1),
+        x: area.x,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, modal);
+    let (title_st, title) = match state.review.as_ref() {
+        Some(f) => (
+            Style::new().fg(theme::GOLD).bg(theme::PANEL),
+            format!(
+                " {} review findings · {} · {} high / {} med / {} low ",
+                theme::GLYPH_HERM,
+                if f.preset.is_empty() { "?" } else { &f.preset },
+                f.count_by("high"),
+                f.count_by("medium"),
+                f.count_by("low")
+            ),
+        ),
+        None => (
+            Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            " review findings ".to_string(),
+        ),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::GOLD).bg(theme::PANEL))
+        .title(Span::styled(title, title_st.add_modifier(Modifier::BOLD)))
+        .style(Style::new().bg(theme::PANEL));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height < 2 || inner.width < 40 {
+        return;
+    }
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(detail_h),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let Some(f) = state.review.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  no review findings yet — run /review (uncommitted | commit | base | custom)",
+                    Style::new().fg(theme::ORANGE).bg(theme::PANEL),
+                )),
+                Line::from(Span::styled(
+                    "  findings land in .officina/review.json after the review turn",
+                    Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                )),
+            ]),
+            chunks[1],
+        );
+        return;
+    };
+
+    // summary line
+    let summary = if f.summary.is_empty() {
+        "(no summary)".to_string()
+    } else {
+        f.summary.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "  {}",
+                trunc(&summary, inner.width.saturating_sub(4) as usize)
+            ),
+            Style::new().fg(theme::TEXT).bg(theme::PANEL),
+        ))),
+        chunks[0],
+    );
+
+    let visible = chunks[1].height as usize;
+    let start = if state.review_sel < visible {
+        0
+    } else {
+        (state.review_sel + 1).saturating_sub(visible)
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    let sev_style = |sev: &str| match sev {
+        "high" => Style::new().fg(theme::RED).bg(theme::PANEL),
+        "medium" => Style::new().fg(theme::ORANGE).bg(theme::PANEL),
+        "low" => Style::new().fg(theme::GOLD).bg(theme::PANEL),
+        _ => Style::new().fg(theme::MUTED).bg(theme::PANEL),
+    };
+    for (idx, finding) in rows.iter().enumerate() {
+        let selected = idx == state.review_sel;
+        let marker = if selected { "▸" } else { " " };
+        let badge = format!("{:<6}", finding.severity);
+        let loc = trunc(&finding.locator(), 34);
+        let text = format!(
+            " {} {:<6} {:<34} {}",
+            marker,
+            badge,
+            loc,
+            trunc(&finding.title, inner.width.saturating_sub(48) as usize)
+        );
+        let style = if selected {
+            Style::new().fg(theme::BG).bg(theme::GOLD)
+        } else {
+            Style::new().fg(theme::TEXT).bg(theme::PANEL)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(text, style),
+            Span::styled("", sev_style(&finding.severity)),
+        ]));
+    }
+    let body: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
+    frame.render_widget(
+        Paragraph::new(body).style(Style::new().bg(theme::PANEL)),
+        chunks[1],
+    );
+
+    // detail pane
+    if detail_h > 0 {
+        if let Some(finding) = rows.get(state.review_sel) {
+            let d: &Finding = finding;
+            let detail_lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        "  {} · {}",
+                        d.title,
+                        trunc(&d.locator(), inner.width.saturating_sub(6) as usize)
+                    ),
+                    Style::new().fg(theme::GOLD).bg(theme::PANEL),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        trunc(&d.detail, inner.width.saturating_sub(4) as usize)
+                    ),
+                    Style::new().fg(theme::TEXT).bg(theme::PANEL),
+                )),
+                Line::from(Span::styled(
+                    "  esc close · ↑↓ navigate",
+                    Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                )),
+            ];
+            frame.render_widget(
+                Paragraph::new(detail_lines).style(Style::new().bg(theme::PANEL)),
+                chunks[2],
+            );
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑↓ select · esc close",
+            Style::new().fg(theme::MUTED).bg(theme::PANEL),
+        ))),
+        chunks[3],
+    );
+}
+
+/// /status (codex-qol stage 2) — read-only session snapshot, help-modal
+/// geometry. Rows were snapshotted at open (no per-frame file reads).
+fn render_status_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let h = (state.status_lines.len() as u16 + 4)
+        .min(area.height.saturating_sub(2))
+        .max(6);
+    let w = area.width.min(80);
+    let modal = Rect {
+        y: area.y + area.height.saturating_sub(h + 1),
+        x: area.x,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::GOLD).bg(theme::PANEL))
+        .title(Span::styled(
+            format!(" {} status ", theme::GLYPH_HERM),
+            Style::new()
+                .fg(theme::GOLD)
+                .bg(theme::PANEL)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(theme::PANEL));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    let lines: Vec<Line> = state
+        .status_lines
+        .iter()
+        .take(inner.height as usize)
+        .map(|(label, value)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {label:<12}"),
+                    Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                ),
+                Span::styled(value.clone(), Style::new().fg(theme::TEXT).bg(theme::PANEL)),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(theme::PANEL)),
+        inner,
+    );
+}
+
+/// /caduceus page (2026-11-12) — full-bleed, four tabs. Facts come from the
+/// extension's caduceus-state.json; policy from the TUI-owned
+/// caduceus-prefs.json. I4: no HTTP from the TUI, no secrets in it either.
+fn render_caduceus_page(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    use crate::tui::caduceus::{self, ModelState, PolicyRow, Tab};
+
+    let Some(page) = state.caduceus.as_ref() else {
+        return;
+    };
+    let now = caduceus::now_ms();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::GOLD).bg(theme::PANEL))
+        .style(Style::new().bg(theme::PANEL));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 6 || inner.width < 40 {
+        return;
+    }
+
+    let detail_h = if page.detail {
+        match page.tab {
+            Tab::Providers => 6,
+            Tab::Models => 4,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(detail_h),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+
+    // ── tab bar ──
+    let mut spans: Vec<Span> = vec![Span::styled(
+        format!(" {} caduceus  ", theme::GLYPH_HERM),
+        Style::new()
+            .fg(theme::GOLD)
+            .bg(theme::PANEL)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        let style = if *tab == page.tab {
+            Style::new()
+                .fg(theme::BG)
+                .bg(theme::GOLD)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme::MUTED).bg(theme::PANEL)
+        };
+        spans.push(Span::styled(format!(" {} {} ", i + 1, tab.label()), style));
+        spans.push(Span::raw(" "));
+    }
+    let stamp = match page.state.as_ref() {
+        Some(s) => {
+            let stale = if s.is_stale(now) { " · STALE" } else { "" };
+            format!(
+                "{} free lanes · state {}{stale}",
+                s.free_candidate_count(),
+                caduceus::fmt_age_ms(s.age_ms(now))
+            )
+        }
+        None => "no state file yet".to_string(),
+    };
+    spans.push(Span::styled(
+        format!("  {stamp}"),
+        Style::new().fg(theme::MUTED).bg(theme::PANEL),
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::new().bg(theme::PANEL)),
+        chunks[0],
+    );
+
+    // ── header row ──
+    let header = match page.tab {
+        Tab::Providers => format!(
+            "{:<22} {:<4} {:<5} {:<4} {:<8} {:>5} {:<8}",
+            "provider", "use", "rank", "key", "gateway", "free", "method"
+        ),
+        Tab::Models => format!(
+            "{:<44} {:<14} {:>8} {:<5} {:<7}",
+            "model", "owner", "ctx", "free", "state"
+        ),
+        Tab::Health => "gateway · catalog · budget · connections".to_string(),
+        Tab::Policy => "policy — space toggles · +/- adjusts".to_string(),
+        Tab::Vitriol => "engine · vitriol-server.service".to_string(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {header}"),
+            Style::new().fg(theme::MUTED).bg(theme::PANEL),
+        ))),
+        chunks[1],
+    );
+
+    // ── body ──
+    let mut lines: Vec<Line> = Vec::new();
+    match page.tab {
+        Tab::Providers => {
+            for (idx, p) in page.provider_view().iter().enumerate() {
+                let selected = idx == page.sel;
+                let use_ = if page.prefs.routing(&p.id) == "off" {
+                    "off"
+                } else {
+                    "on"
+                };
+                let rank = page
+                    .prefs
+                    .rank(&p.id)
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let key = if p.key_present { "✓" } else { "—" };
+                let method = if p.method.is_empty() {
+                    p.category.as_str()
+                } else {
+                    p.method.as_str()
+                };
+                let text = format!(
+                    "  {:<22} {:<4} {:<5} {:<4} {:<8} {:>5} {:<8}",
+                    trunc(&p.id, 22),
+                    use_,
+                    rank,
+                    key,
+                    p.gateway,
+                    p.free_models,
+                    method
+                );
+                lines.push(Line::from(Span::styled(text, caduceus_row_style(selected))));
+            }
+        }
+        Tab::Models => {
+            for (idx, c) in page.candidate_view().iter().enumerate() {
+                let selected = idx == page.sel;
+                let state_label = if page.show_hidden && page.prefs.is_hidden(&c.id) {
+                    "hidden"
+                } else {
+                    page.prefs.model_state(&c.id).label()
+                };
+                let text = format!(
+                    "  {:<44} {:<14} {:>8} {:<5} {:<7}",
+                    trunc(&c.id, 44),
+                    trunc(&c.owner, 14),
+                    caduceus::fmt_count(c.context_window),
+                    if c.free { "✓" } else { "paid" },
+                    state_label
+                );
+                let style = if selected {
+                    caduceus_row_style(true)
+                } else if page.prefs.is_hidden(&c.id) {
+                    Style::new().fg(theme::MUTED).bg(theme::PANEL)
+                } else {
+                    caduceus_row_style(false)
+                };
+                lines.push(Line::from(Span::styled(text, style)));
+            }
+        }
+        Tab::Health => match page.state.as_ref() {
+            Some(s) => {
+                let b = &s.budget;
+                let pct = |used: u64, cap: u64| {
+                    if cap == 0 {
+                        "—".to_string()
+                    } else {
+                        format!("{:.0}%", used as f64 * 100.0 / cap as f64)
+                    }
+                };
+                let rows = [
+                    format!("gateway      {}", if s.gateway_up { "Up" } else { "DOWN" }),
+                    format!("base url     {}", trunc(&s.base_url, 64)),
+                    format!(
+                        "catalog      {} models · fetched {}",
+                        s.catalog_count,
+                        if s.catalog_fetched_at.is_empty() {
+                            "—".to_string()
+                        } else {
+                            trunc(&s.catalog_fetched_at, 24)
+                        }
+                    ),
+                    format!(
+                        "budget       day {} / {} ({}) · month {} / {} ({})",
+                        caduceus::fmt_count(b.daily_tokens),
+                        caduceus::fmt_count(b.daily_cap),
+                        pct(b.daily_tokens, b.daily_cap),
+                        caduceus::fmt_count(b.monthly_tokens),
+                        caduceus::fmt_count(b.monthly_cap),
+                        pct(b.monthly_tokens, b.monthly_cap)
+                    ),
+                    format!(
+                        "cap state    {} · paid {}",
+                        if b.allowed {
+                            "within cap"
+                        } else {
+                            "CAP REACHED"
+                        },
+                        if b.paid_allowed { "allowed" } else { "never" }
+                    ),
+                    format!("cooling      {} models", s.cooling),
+                    format!(
+                        "connections  {} active · {} backoff · {} hard-down",
+                        s.connections.active.len(),
+                        s.connections.backoff.len(),
+                        s.connections.hard_down.len()
+                    ),
+                    format!(
+                        "active       {}",
+                        trunc(&s.connections.active.join(", "), 92)
+                    ),
+                    format!(
+                        "backoff      {}",
+                        trunc(&s.connections.backoff.join(", "), 92)
+                    ),
+                    format!(
+                        "hard-down    {}",
+                        trunc(&s.connections.hard_down.join(", "), 92)
+                    ),
+                    format!(
+                        "keys         {} readable rows · inference {}",
+                        s.keys.len(),
+                        if s.inference_key.is_empty() {
+                            "MISSING"
+                        } else {
+                            "set"
+                        }
+                    ),
+                ];
+                for row in rows {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {row}"),
+                        Style::new().fg(theme::TEXT).bg(theme::PANEL),
+                    )));
+                }
+            }
+            None => {
+                lines.push(Line::from(Span::styled(
+                    "  no ~/.vitriol/officina/caduceus-state.json yet — the caduceus extension writes it at session start + every 60s",
+                    Style::new().fg(theme::ORANGE).bg(theme::PANEL),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  run `vitriol caduceus setup` if the gateway is not installed",
+                    Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                )));
+            }
+        },
+        Tab::Vitriol => match page.engine.as_ref() {
+            Some(e) => {
+                let state_st = match e.state.as_str() {
+                    "active" => Style::new().fg(theme::GREEN).bg(theme::PANEL),
+                    "inactive" => Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                    _ => Style::new().fg(theme::ORANGE).bg(theme::PANEL),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  unit       ",
+                        Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                    ),
+                    Span::styled(
+                        "vitriol-server.service",
+                        Style::new().fg(theme::TEXT).bg(theme::PANEL),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  state      ",
+                        Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{}{}{}",
+                            e.state,
+                            if e.pid.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (pid {})", e.pid)
+                            },
+                            if e.since.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · since {}", e.since)
+                            }
+                        ),
+                        state_st,
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  last log   {}",
+                        trunc(&e.last_log, inner.width.saturating_sub(14) as usize)
+                    ),
+                    Style::new().fg(theme::TEXT).bg(theme::PANEL),
+                )));
+                lines.push(Line::from(Span::styled(
+                        "  controls   S start · X stop · R restart (press twice to confirm) · r re-sample",
+                        Style::new().fg(theme::GOLD).bg(theme::PANEL),
+                    )));
+                lines.push(Line::from(Span::styled(
+                        "  config     your live daily driver (unit as-is; `vitriol config load <profile>` outside the TUI)",
+                        Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                    )));
+                lines.push(Line::from(Span::styled(
+                    "  ── config view (read-only · j/k scroll · docs/engine-settings.md) ──",
+                    Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                )));
+                match page.config.as_ref() {
+                    Some(rows) => {
+                        let start = page.config_scroll.min(rows.len());
+                        for r in rows.iter().skip(start) {
+                            let val_st = if r.risk {
+                                Style::new().fg(theme::ORANGE).bg(theme::PANEL)
+                            } else {
+                                Style::new().fg(theme::TEXT).bg(theme::PANEL)
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!(
+                                        "  {:<24} {:<14}",
+                                        trunc(&r.label(), 24),
+                                        trunc(&r.value, 14)
+                                    ),
+                                    val_st,
+                                ),
+                                Span::styled(
+                                    trunc(r.explain, inner.width.saturating_sub(44) as usize),
+                                    Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                                ),
+                            ]));
+                        }
+                    }
+                    None => lines.push(Line::from(Span::styled(
+                        "  config not readable (~/.vitriol/config)",
+                        Style::new().fg(theme::ORANGE).bg(theme::PANEL),
+                    ))),
+                }
+            }
+            None => {
+                lines.push(Line::from(Span::styled(
+                    "  engine facts not sampled yet — press r",
+                    Style::new().fg(theme::ORANGE).bg(theme::PANEL),
+                )));
+            }
+        },
+        Tab::Policy => {
+            for (idx, row) in page.policy_rows().iter().enumerate() {
+                let selected = idx == page.sel;
+                let text = match row {
+                    PolicyRow::FreeOnly => format!(
+                        "  {:<24} {}",
+                        "free only",
+                        if page.prefs.free_only { "on" } else { "off" }
+                    ),
+                    PolicyRow::PerOwner => {
+                        format!("  {:<24} {} (1–32)", "per-owner cap", page.prefs.per_owner)
+                    }
+                    PolicyRow::MaxCandidates => format!(
+                        "  {:<24} {} (1–256)",
+                        "max candidates", page.prefs.max_candidates
+                    ),
+                    PolicyRow::AllowPaid { provider, allow } => format!(
+                        "  {:<24} {}",
+                        format!("allow paid · {provider}"),
+                        if *allow { "yes" } else { "no" }
+                    ),
+                };
+                lines.push(Line::from(Span::styled(text, caduceus_row_style(selected))));
+            }
+        }
+    }
+    let visible = chunks[2].height as usize;
+    let start = if visible == 0 {
+        0
+    } else if page.sel < visible {
+        0
+    } else {
+        (page.sel + 1).saturating_sub(visible)
+    };
+    let body_lines: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
+    frame.render_widget(
+        Paragraph::new(body_lines).style(Style::new().bg(theme::PANEL)),
+        chunks[2],
+    );
+
+    // ── detail pane ──
+    if page.detail && detail_h > 0 {
+        let detail = match page.tab {
+            Tab::Providers => page.provider_view().get(page.sel).map(|p| {
+                vec![
+                    format!("{} — {}", p.id, p.name),
+                    format!(
+                        "website   {}",
+                        if p.website.is_empty() {
+                            "—"
+                        } else {
+                            p.website.as_str()
+                        }
+                    ),
+                    format!(
+                        "env       {} · key {}",
+                        if p.credential_env.is_empty() {
+                            "—"
+                        } else {
+                            p.credential_env.as_str()
+                        },
+                        if p.key_present { "present" } else { "missing" }
+                    ),
+                    format!(
+                        "free      {} · {} free models",
+                        if p.has_free { "yes" } else { "no" },
+                        p.free_models
+                    ),
+                    format!(
+                        "signup    {} · status {}",
+                        if p.method.is_empty() {
+                            "—"
+                        } else {
+                            p.method.as_str()
+                        },
+                        if p.signup_status.is_empty() {
+                            "pending"
+                        } else {
+                            p.signup_status.as_str()
+                        }
+                    ),
+                    format!(
+                        "notes     {}{}",
+                        trunc(&p.free_note, 48),
+                        if p.auth_hint.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", trunc(&p.auth_hint, 40))
+                        }
+                    ),
+                ]
+            }),
+            Tab::Models => page.candidate_view().get(page.sel).map(|c| {
+                vec![
+                    c.id.clone(),
+                    format!(
+                        "owner     {} · ctx {} · max {} · {}",
+                        c.owner,
+                        caduceus::fmt_count(c.context_window),
+                        caduceus::fmt_count(c.max_tokens),
+                        if c.free { "free" } else { "paid" }
+                    ),
+                    format!(
+                        "state     {}{}",
+                        match page.prefs.model_state(&c.id) {
+                            ModelState::Neutral => "neutral (space: pin → deny → neutral)",
+                            other => other.label(),
+                        },
+                        if page.prefs.is_hidden(&c.id) {
+                            " · hidden (h unhides, H reveals)"
+                        } else {
+                            " · visible (h hides)"
+                        }
+                    ),
+                ]
+            }),
+            _ => None,
+        };
+        if let Some(rows) = detail {
+            let detail_lines: Vec<Line> = rows
+                .into_iter()
+                .take(chunks[3].height as usize)
+                .map(|r| {
+                    Line::from(Span::styled(
+                        format!("  {r}"),
+                        Style::new().fg(theme::TEXT).bg(theme::PANEL),
+                    ))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(detail_lines).style(Style::new().bg(theme::PANEL)),
+                chunks[3],
+            );
+        }
+    }
+
+    // ── footer ──
+    let mut footer = vec![Line::from(Span::styled(
+        "  tab switch · space toggle · +/- rank/cap · h hide · H show hidden · a add key · A wizard · o oauth/site · / filter · r reload · esc close",
+        Style::new().fg(theme::MUTED).bg(theme::PANEL),
+    ))];
+    if page.filtering {
+        footer.push(Line::from(Span::styled(
+            format!("  /{}_", page.filter),
+            Style::new().fg(theme::GOLD).bg(theme::PANEL),
+        )));
+    } else if let Some(arm) = page.engine_arm.as_ref() {
+        footer.push(Line::from(Span::styled(
+            format!(
+                "  ARMED: press {} again to confirm engine {} (any other key cancels)",
+                arm.chars().next().unwrap_or('?').to_string(),
+                arm
+            ),
+            Style::new().fg(theme::ORANGE).bg(theme::PANEL),
+        )));
+    } else if let Some(note) = page.note.as_ref() {
+        let style = if note.contains("ignored") || note.contains("failed") {
+            theme::ORANGE
+        } else {
+            theme::GREEN
+        };
+        footer.push(Line::from(Span::styled(
+            format!("  {note} · {}", page.policy_summary()),
+            Style::new().fg(style).bg(theme::PANEL),
+        )));
+    } else {
+        footer.push(Line::from(Span::styled(
+            format!("  {}", page.policy_summary()),
+            Style::new().fg(theme::MUTED).bg(theme::PANEL),
+        )));
+    }
+    footer.truncate(chunks[4].height as usize);
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::new().bg(theme::PANEL)),
+        chunks[4],
+    );
+}
+
+fn caduceus_row_style(selected: bool) -> Style {
+    if selected {
+        Style::new().fg(theme::BG).bg(theme::GOLD)
+    } else {
+        Style::new().fg(theme::TEXT).bg(theme::PANEL)
+    }
+}
+
 fn render_cache_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
     use crate::tui::cache as c;
     let h = area
@@ -2188,5 +3566,138 @@ mod composer_wrap_tests {
             "all 40 chars must remain visible after wrapping: {:?}",
             rows
         );
+    }
+}
+
+#[cfg(test)]
+mod render_smoke {
+    //! Every surface at several terminal sizes (2026-11-13 crash hunt):
+    //! a panic here reproduces an "Officina crashed" render path.
+
+    use super::*;
+
+    fn draw_at(state: &mut AppState, w: u16, h: u16) {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render(f, state))
+            .expect("draw must not panic");
+    }
+
+    fn base_state() -> AppState {
+        let mut s = AppState::default();
+        s.mark_activity();
+        s.cwd = std::path::PathBuf::from("/tmp/proj");
+        s.tool_start(
+            Some("c1"),
+            "bash",
+            &serde_json::json!({"command": "brievc build c4probe.bv --verify-bodies", "timeout": 240}),
+        );
+        s.tool_update(Some("c1"), "bash", "compiling…\n");
+        s.apply_notify(
+            "hang-watchdog: \"brievc build\" — no output for 61s",
+            "warning",
+        );
+        s.apply_notify(
+            "note with a longer body that will wrap across the modal width",
+            "info",
+        );
+        s.entries.push(crate::tui::state::ChatEntry::Notice(
+            "multi-line table\nrow one\nrow two".into(),
+        ));
+        s
+    }
+
+    #[test]
+    fn all_modals_render_at_common_sizes() {
+        for (w, h) in [(40u16, 12u16), (80, 24), (120, 40)] {
+            // fx modal
+            let mut s = base_state();
+            s.fx_open = true;
+            for sel in 0..4 {
+                s.fx_sel = sel;
+                draw_at(&mut s, w, h);
+            }
+            // answers modal (with a doc)
+            let mut s = base_state();
+            s.answers_open = true;
+            s.answers = Some(super::super::state::AnswerDoc {
+                version: 1,
+                ts: 1,
+                question: "how does the cache layer work?".into(),
+                answer: "It stores prompt KV per slot.\n".repeat(30),
+            });
+            draw_at(&mut s, w, h);
+            // cost modal
+            let mut s = base_state();
+            s.cost_open = true;
+            s.cost = Some(crate::tui::cost::CostReport::default());
+            draw_at(&mut s, w, h);
+            // review findings
+            let mut s = base_state();
+            s.review_open = true;
+            s.review = crate::tui::review::parse(
+                r#"{"version":1,"preset":"uncommitted","summary":"s",
+                    "findings":[{"severity":"high","file":"a.rs","line":"3","title":"t","detail":"d"}]}"#,
+            );
+            draw_at(&mut s, w, h);
+            // cross-project sessions
+            let mut s = base_state();
+            s.xsessions_open = true;
+            s.xsessions_open_with(Vec::new());
+            draw_at(&mut s, w, h);
+            // status
+            let mut s = base_state();
+            s.status_open_modal();
+            draw_at(&mut s, w, h);
+            // caduceus page, every tab (config rows injected)
+            let mut s = base_state();
+            if let Some(page) = s.caduceus.as_mut() {
+                page.tab = crate::tui::caduceus::Tab::Vitriol;
+                page.engine = Some(crate::tui::caduceus::probe_engine());
+                page.config = Some(crate::tui::engine_config::parse_rows(
+                    "[gpu]\ntensor_split = 27,21\n[model]\nmmproj =\n",
+                ));
+            } else {
+                s.caduceus = Some(crate::tui::caduceus::Page::default());
+                let page = s.caduceus.as_mut().unwrap();
+                page.tab = crate::tui::caduceus::Tab::Vitriol;
+                page.config = Some(crate::tui::engine_config::parse_rows(
+                    "[gpu]\ntensor_split = 27,21\n[model]\nmmproj =\n",
+                ));
+            }
+            for tab in crate::tui::caduceus::Tab::ALL {
+                if let Some(page) = s.caduceus.as_mut() {
+                    page.set_tab(tab);
+                }
+                draw_at(&mut s, w, h);
+            }
+        }
+    }
+
+    #[test]
+    fn watchdog_card_and_fire_render_with_facts() {
+        let mut s = base_state();
+        let now = crate::tui::caduceus::now_ms();
+        s.watchdog = crate::tui::state::load_watchdog_doc().or_else(|| {
+            Some(crate::tui::state::WatchdogDoc {
+                version: 1,
+                ts: now,
+                kind: "verdict".into(),
+                command: "brievc build c4probe.bv".into(),
+                elapsed_s: 252,
+                stalled_s: 189,
+                verdict: "HUNG".into(),
+                reason: "waiting on stdin".into(),
+                next_check_at: now + 21_000,
+                phase: "rejudge".into(),
+            })
+        });
+        s.fire_on = true;
+        s.fire_target = 0.8;
+        s.fire_level = 0.8;
+        for (w, h) in [(40u16, 12u16), (100, 30)] {
+            draw_at(&mut s, w, h);
+        }
     }
 }

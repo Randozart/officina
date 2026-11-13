@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::text::Span;
 
@@ -223,6 +223,8 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     ("^v", "cycle tool verbosity (line/block/full)"),
     ("^t", "tool verbosity picker"),
     ("F9", "stderr diagnostics overlay"),
+    ("alt+e", "edit the draft in $VISUAL/$EDITOR"),
+    ("^o", "attach the clipboard image (alt+o clears)"),
     ("F1", "this help"),
 ];
 
@@ -307,6 +309,14 @@ pub enum ChatEntry {
     },
     /// Diagnostic notice (extension errors, retries, stderr surfacing).
     Diag(String),
+    /// Long info-notify captured into the transcript (QoL batch stage 3,
+    /// 2026-11-12): multi-line tables (/free, /nimbus, /phase-models) were
+    /// invisible beyond the 40-char glance row. Neutral violet — NOT an
+    /// error (Diag renders with theme::crit, which is red).
+    Notice(String),
+    /// hang-watchdog entry (2026-11-13): rendered as a compact amber-bordered
+    /// block instead of a red Diag line — it is an observation, not an error.
+    Watchdog(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -327,6 +337,72 @@ pub enum DialogKind {
     Select,
     Input,
     Editor,
+}
+
+/// INQUIRE answer (2026-11-13): versioned facts file written by the
+/// agent-mode extension; rendered by /answers.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct AnswerDoc {
+    pub version: u32,
+    pub ts: u64,
+    pub question: String,
+    pub answer: String,
+}
+
+/// Structured watchdog facts (2026-11-13): written by the hang-watchdog
+/// extension; the transcript renders fields and the tool row shows a
+/// countdown, instead of dumping prose.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct WatchdogDoc {
+    pub version: u32,
+    pub ts: u64,
+    pub kind: String,
+    pub command: String,
+    pub elapsed_s: u64,
+    pub stalled_s: u64,
+    pub verdict: String,
+    pub reason: String,
+    pub next_check_at: u64,
+    pub phase: String,
+}
+
+/// A staged next-prompt suggestion (voice-suggestions stage 1).
+#[derive(Debug, Clone)]
+pub struct GhostSuggestion {
+    pub id: String,
+    pub text: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+struct SuggestionFile {
+    version: u32,
+    id: String,
+    text: String,
+    source: String,
+    expires: u64,
+}
+
+impl Default for SuggestionFile {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            id: String::new(),
+            text: String::new(),
+            source: String::new(),
+            expires: 0,
+        }
+    }
+}
+
+/// One staged clipboard image (codex-qol stage 9).
+#[derive(Debug, Clone)]
+pub struct PendingImage {
+    pub path: std::path::PathBuf,
+    pub mime: String,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +554,8 @@ pub struct AppState {
     pub resume_open: bool,
     pub resume_entries: Vec<crate::rpc::sessions::SessionEntry>,
     pub resume_sel: usize,
+    /// Codex-QoL stage 3: typeable filter over title/path in the picker.
+    pub resume_filter: String,
 
     // /model picker modal (owner request 2026-11-10 — parity with the JS
     // TUI's selector instead of blind cycle).
@@ -501,6 +579,93 @@ pub struct AppState {
     pub cache_sel: usize,
     pub cache_dir: String,
     pub cache_total: u64,
+
+    // /caduceus page (2026-11-12): facts from the extension's state file,
+    // policy from the TUI-owned prefs file. The TUI never does HTTP and
+    // never sees secrets (I4); it writes caduceus-prefs.json only.
+    pub caduceus: Option<crate::tui::caduceus::Page>,
+    /// Deferred external flow (stage 4): argv the loop runs after suspending
+    /// the TUI (none = no suspend). Set by the caduceus page's A/o keys.
+    pub caduceus_suspend: Option<Vec<String>>,
+    /// /status modal (codex-qol stage 2): read-only session snapshot, built
+    /// once at open (file reads must not happen per frame).
+    pub status_open: bool,
+    pub status_lines: Vec<(&'static str, String)>,
+    /// Deferred $EDITOR hand-off (codex-qol stage 4): argv + tmp file + the
+    /// composer draft as it was, so a failed edit never loses text (I4).
+    pub editor_suspend: Option<(Vec<String>, std::path::PathBuf, String)>,
+    /// /cost modal (exec-infra stage 5): today's route ledger, read-only.
+    pub cost_open: bool,
+    pub cost: Option<crate::tui::cost::CostReport>,
+    /// Turn clock (2026-11-13): stamped when streaming starts, cleared when
+    /// it settles — drives the "working… Ns" readouts.
+    pub turn_started_at: Option<std::time::Instant>,
+    /// Safe-quit arm (2026-11-13): when a turn/tool is in flight, the first
+    /// quit press arms a 5 s confirm window instead of killing the work.
+    pub quit_armed_at: Option<std::time::Instant>,
+    /// Thinking display (2026-11-13): hide thinking blocks behind a collapsed
+    /// marker line; persisted at ~/.vitriol/officina/tui-thinking.
+    pub hide_thinking: bool,
+    /// Latest structured watchdog facts (card + countdown).
+    pub watchdog: Option<WatchdogDoc>,
+    /// Injectable watchdog facts path (tests must never read the
+    /// operator's live file).
+    pub watchdog_file: Option<std::path::PathBuf>,
+    /// /fx modal (2026-11-13): fire + glimmer controls with a live preview.
+    pub fx_open: bool,
+    pub fx_sel: usize,
+    /// /answers panel (2026-11-13): the last INQUIRE-mode question + answer,
+    /// written by the agent-mode extension as a facts file.
+    pub answers_open: bool,
+    pub answers: Option<AnswerDoc>,
+    pub answers_scroll: u16,
+    pub answers_mtime_seen: Option<std::time::SystemTime>,
+    /// Prompt history (2026-11-13, owner request): Up/Down through earlier
+    /// prompts, persisted to ~/.vitriol/officina/input-history.jsonl.
+    pub prompt_history: Vec<String>,
+    pub history_idx: Option<usize>,
+    pub history_draft: String,
+    /// Engine telemetry freshness: when the `engine-fire` widget stops
+    /// reporting (engine down / cloud lane), the flames derive from STREAM
+    /// deltas instead — so cloud-model turns animate too (2026-11-13).
+    pub engine_fire_seen: Option<std::time::Instant>,
+    /// Delta-driven heat accumulator (bumped per streamed delta, decayed
+    /// per animation step).
+    pub stream_heat: f64,
+    /// Liveliness contract (2026-11-13): wall-clock of the last REAL
+    /// signal (streamed text, tool events, agent start/end, prompt submit).
+    /// Fire only burns while this is fresh — animations never lie.
+    pub last_activity: Option<std::time::Instant>,
+    /// Liveness evidence (2026-11-12): CPU seconds of pi's bash subtree,
+    /// sampled from /proc and shown in the running tool row — proof the
+    /// work is real even when output is silent (redirected to logs).
+    pub liveness_cpu_total: f64,
+    pub liveness_prev_total: f64,
+    pub liveness_delta: f64,
+    pub liveness_flat_secs: u64,
+    pub liveness_sampled_at: Option<std::time::Instant>,
+    pub liveness_unavailable: bool,
+    /// Voice-suggestion ghost text (stage 2, 2026-11-12): rendered dimmed
+    /// in the empty composer; → accepts, typing/Esc dismisses. Never sent.
+    pub prompt_ghost: Option<GhostSuggestion>,
+    pub ghost_dismissed_for: Option<String>,
+    /// Injectable paths so tests never touch the operator's files.
+    pub prompt_suggestion_file: Option<std::path::PathBuf>,
+    pub ghost_events_file: Option<std::path::PathBuf>,
+    /// /sessions cross-project picker (exec-infra stage 4): every store,
+    /// newest first. Foreign projects render READ-ONLY (I4).
+    pub xsessions_open: bool,
+    pub xsessions: Vec<crate::rpc::sessions::AllSessionEntry>,
+    pub xsessions_sel: usize,
+    pub xsessions_filter: String,
+    /// /review-findings modal (codex-qol stage 7): severity-sorted findings
+    /// from .officina/review.json, written by the review extension.
+    pub review_open: bool,
+    pub review: Option<crate::tui::review::ReviewFindings>,
+    pub review_sel: usize,
+    /// Clipboard image attachments (codex-qol stage 9, I5): capped, temp
+    /// files encoded to base64 at send, cleared after a successful submit.
+    pub pending_images: Vec<PendingImage>,
 
     // Diagnostics overlay (F9)
     pub show_diag: bool,
@@ -635,6 +800,7 @@ impl Default for AppState {
             resume_open: false,
             resume_entries: Vec::new(),
             resume_sel: 0,
+            resume_filter: String::new(),
             models_open: false,
             models: Vec::new(),
             models_sel: 0,
@@ -648,6 +814,48 @@ impl Default for AppState {
             cache_sel: 0,
             cache_dir: String::new(),
             cache_total: 0,
+            caduceus: None,
+            caduceus_suspend: None,
+            status_open: false,
+            status_lines: Vec::new(),
+            editor_suspend: None,
+            review_open: false,
+            review: None,
+            review_sel: 0,
+            cost_open: false,
+            cost: None,
+            turn_started_at: None,
+            quit_armed_at: None,
+            hide_thinking: load_hide_thinking(),
+            watchdog: None,
+            watchdog_file: None,
+            fx_open: false,
+            fx_sel: 0,
+            answers_open: false,
+            answers: None,
+            answers_scroll: 0,
+            answers_mtime_seen: None,
+            prompt_history: load_prompt_history(),
+            history_idx: None,
+            history_draft: String::new(),
+            engine_fire_seen: None,
+            stream_heat: 0.0,
+            last_activity: None,
+            liveness_cpu_total: 0.0,
+            liveness_prev_total: 0.0,
+            liveness_delta: 0.0,
+            liveness_flat_secs: 0,
+            liveness_sampled_at: None,
+            liveness_unavailable: false,
+            prompt_ghost: None,
+            ghost_dismissed_for: None,
+            prompt_suggestion_file: None,
+            ghost_events_file: None,
+            xsessions_open: false,
+            xsessions: Vec::new(),
+            xsessions_sel: 0,
+            xsessions_filter: String::new(),
+            pending_images: Vec::new(),
             show_diag: false,
             diag_view: Vec::new(),
             input: String::new(),
@@ -1057,6 +1265,10 @@ impl AppState {
         ),
         ("auto", "allow risky shell; sensitive paths still prompt"),
         ("yolo", "allow everything EXCEPT sensitive roots/secrets"),
+        (
+            "sandboxed",
+            "bash runs in a bwrap box: ro filesystem, rw cwd+/tmp, no net unless OFFICINA_SANDBOX_NET=1",
+        ),
     ];
 
     pub fn permissions_mode_index(&self) -> usize {
@@ -1111,6 +1323,543 @@ impl AppState {
         self.cache_refresh();
         self.cache_sel = 0;
         self.cache_open = true;
+    }
+
+    /// `/caduceus` — load the facts snapshot + policy and open the page.
+    /// A missing state file renders an honest "no state" hint; corrupt
+    /// prefs fall back to defaults and say so in the footer (I6).
+    pub fn caduceus_open_page(&mut self) {
+        self.note_phase(UiEvent::OpenModal);
+        self.caduceus = Some(crate::tui::caduceus::Page::load());
+    }
+
+    /// Resume picker rows honour the typeable filter (case-insensitive
+    /// substring over title + path).
+    pub fn filtered_resume_entries(&self) -> Vec<&crate::rpc::sessions::SessionEntry> {
+        if self.resume_filter.is_empty() {
+            return self.resume_entries.iter().collect();
+        }
+        let needle = self.resume_filter.to_lowercase();
+        self.resume_entries
+            .iter()
+            .filter(|e| {
+                e.title.to_lowercase().contains(&needle)
+                    || e.path.to_string_lossy().to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    pub fn clamp_resume_sel(&mut self) {
+        let n = self.filtered_resume_entries().len();
+        if self.resume_sel >= n {
+            self.resume_sel = n.saturating_sub(1);
+        }
+    }
+
+    /// Stage the composer draft for an external $EDITOR run (codex-qol
+    /// stage 4). Testable core: `editor` is the raw $VISUAL/$EDITOR string.
+    /// The draft is written to a temp file and kept verbatim in the request,
+    /// so a failed spawn/reload never loses text (I4).
+    pub fn stage_editor(&mut self, editor: &str) {
+        if self.editor_suspend.is_some() {
+            return;
+        }
+        let mut argv: Vec<String> = editor.split_whitespace().map(String::from).collect();
+        if argv.is_empty() {
+            self.notice = Some((
+                "editor: empty $VISUAL/$EDITOR — draft kept".into(),
+                "warning".into(),
+            ));
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "officina-compose-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        if let Err(e) = std::fs::write(&tmp, &self.input) {
+            self.notice = Some((
+                format!("editor: temp write failed ({e}) — draft kept"),
+                "warning".into(),
+            ));
+            return;
+        }
+        argv.push(tmp.to_string_lossy().to_string());
+        self.editor_suspend = Some((argv, tmp, self.input.clone()));
+    }
+
+    /// `/sessions` — open the cross-project picker over a completed scan.
+    pub fn xsessions_open_with(&mut self, entries: Vec<crate::rpc::sessions::AllSessionEntry>) {
+        self.note_phase(UiEvent::OpenModal);
+        self.xsessions = entries;
+        self.xsessions_sel = 0;
+        self.xsessions_filter.clear();
+        self.xsessions_open = true;
+    }
+
+    pub fn xsessions_close(&mut self) {
+        if self.xsessions_open {
+            self.note_phase(UiEvent::CloseModal);
+            self.xsessions_open = false;
+        }
+    }
+
+    pub fn xsessions_view(&self) -> Vec<&crate::rpc::sessions::AllSessionEntry> {
+        if self.xsessions_filter.is_empty() {
+            return self.xsessions.iter().collect();
+        }
+        let needle = self.xsessions_filter.to_lowercase();
+        self.xsessions
+            .iter()
+            .filter(|a| {
+                a.entry.title.to_lowercase().contains(&needle)
+                    || a.project.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    pub fn clamp_xsessions_sel(&mut self) {
+        let n = self.xsessions_view().len();
+        if self.xsessions_sel >= n {
+            self.xsessions_sel = n.saturating_sub(1);
+        }
+    }
+
+    /// `/review-findings` — load the last review's findings and open the
+    /// modal. A missing file opens an honest hint (I3).
+    pub fn review_open_modal(&mut self) {
+        self.note_phase(UiEvent::OpenModal);
+        self.review = crate::tui::review::load(&self.cwd);
+        self.review_sel = 0;
+        self.review_open = true;
+    }
+
+    /// ^o — stage a clipboard image (cap 4, I5).
+    pub fn attach_image(&mut self, path: std::path::PathBuf, mime: String) {
+        if self.pending_images.len() >= crate::tui::paste::MAX_IMAGES {
+            return;
+        }
+        self.pending_images.push(PendingImage { path, mime });
+    }
+
+    pub fn clear_images(&mut self) {
+        for img in self.pending_images.drain(..) {
+            let _ = std::fs::remove_file(&img.path);
+        }
+    }
+
+    pub fn review_close(&mut self) {
+        if self.review_open {
+            self.note_phase(UiEvent::CloseModal);
+            self.review_open = false;
+        }
+    }
+
+    pub fn review_rows(&self) -> Vec<&crate::tui::review::Finding> {
+        self.review.as_ref().map(|f| f.sorted()).unwrap_or_default()
+    }
+
+    pub fn clamp_review_sel(&mut self) {
+        let n = self.review_rows().len();
+        if n == 0 {
+            self.review_sel = 0;
+        } else if self.review_sel >= n {
+            self.review_sel = n - 1;
+        }
+    }
+
+    /// Voice ghost (stage 2): read the staged suggestion; show it only when
+    /// the composer is empty, idle, and this id wasn't already dismissed.
+    /// Corrupt/expired files = silently off (I5).
+    pub fn refresh_ghost(&mut self) {
+        if !self.input.is_empty() || self.is_streaming || self.has_running_tool() {
+            self.prompt_ghost = None;
+            return;
+        }
+        let path = self
+            .prompt_suggestion_file
+            .clone()
+            .unwrap_or_else(prompt_suggestion_path);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            self.prompt_ghost = None;
+            return;
+        };
+        let Ok(doc) = serde_json::from_str::<SuggestionFile>(&raw) else {
+            self.prompt_ghost = None;
+            return;
+        };
+        if doc.version != 1 || doc.text.trim().is_empty() {
+            self.prompt_ghost = None;
+            return;
+        }
+        if doc.expires > 0 && doc.expires <= crate::tui::caduceus::now_ms() {
+            self.prompt_ghost = None;
+            return;
+        }
+        if self.ghost_dismissed_for.as_deref() == Some(doc.id.as_str()) {
+            return;
+        }
+        self.prompt_ghost = Some(GhostSuggestion {
+            id: doc.id,
+            text: doc.text,
+            source: doc.source,
+        });
+    }
+
+    /// → — fold the ghost into the real draft (I1: the operator pressed a
+    /// key; nothing was ever pre-sent).
+    pub fn accept_ghost(&mut self) -> bool {
+        let Some(g) = self.prompt_ghost.take() else {
+            return false;
+        };
+        self.cursor = g.text.chars().count();
+        self.input = g.text;
+        self.ghost_dismissed_for = None;
+        self.log_ghost_event(&g.id, &g.source, "accepted");
+        true
+    }
+
+    /// Typing or Esc — the ghost yields to the operator's own words.
+    pub fn dismiss_ghost(&mut self, verdict: &str) {
+        if let Some(g) = self.prompt_ghost.take() {
+            self.ghost_dismissed_for = Some(g.id.clone());
+            self.log_ghost_event(&g.id, &g.source, verdict);
+        }
+    }
+
+    fn log_ghost_event(&self, id: &str, source: &str, verdict: &str) {
+        use std::io::Write;
+        let path = self
+            .ghost_events_file
+            .clone()
+            .unwrap_or_else(ghost_events_path);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // I4: ids + verdicts only — never the prompt text.
+        let line = serde_json::json!({
+            "ts": crate::tui::caduceus::now_ms(),
+            "id": id,
+            "source": source,
+            "verdict": verdict,
+        });
+        if let Ok(mut f) = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)
+        } {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// `/answers` — load the last INQUIRE answer and open the panel.
+    pub fn answers_open_modal(&mut self) {
+        self.note_phase(UiEvent::OpenModal);
+        self.answers = load_answer_doc();
+        self.answers_scroll = 0;
+        self.answers_mtime_seen = answer_mtime();
+        self.answers_open = true;
+    }
+
+    pub fn answers_close(&mut self) {
+        if self.answers_open {
+            self.note_phase(UiEvent::CloseModal);
+            self.answers_open = false;
+        }
+    }
+
+    /// After each turn: if the answer file changed, ping the operator.
+    pub fn refresh_answers_notice(&mut self) {
+        let mtime = answer_mtime();
+        if mtime.is_some() && mtime != self.answers_mtime_seen {
+            self.answers_mtime_seen = mtime;
+            self.notice = Some(("answer ready — /answers".into(), "info".into()));
+        }
+    }
+
+    /// Safe quit (2026-11-13): returns true when quitting may proceed.
+    /// While a turn streams or a tool runs, the first press arms a 5 s
+    /// confirm window; idle quits proceed immediately (I2).
+    pub fn quit_may_proceed(&mut self) -> bool {
+        let busy = self.is_streaming || self.has_running_tool();
+        if !busy {
+            self.quit_armed_at = None;
+            return true;
+        }
+        let now = std::time::Instant::now();
+        match self.quit_armed_at {
+            Some(t) if now.duration_since(t).as_secs() < 5 => {
+                self.quit_armed_at = None;
+                true
+            }
+            _ => {
+                self.quit_armed_at = Some(now);
+                self.notice = Some((
+                    "working — press again to quit anyway (esc waits)".into(),
+                    "warning".into(),
+                ));
+                false
+            }
+        }
+    }
+
+    /// Record a sent prompt (dedupe consecutive, cap 200) + persist.
+    pub fn record_prompt_history(&mut self, msg: &str) {
+        self.mark_activity();
+        let msg = msg.trim();
+        if msg.is_empty() {
+            return;
+        }
+        if self
+            .prompt_history
+            .last()
+            .map(|m| m == msg)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.prompt_history.push(msg.to_string());
+        if self.prompt_history.len() > 200 {
+            let drop = self.prompt_history.len() - 200;
+            self.prompt_history.drain(..drop);
+        }
+        append_prompt_history(msg);
+        self.history_idx = None;
+        self.history_draft.clear();
+    }
+
+    /// Up — step back through history; the in-progress draft is preserved
+    /// and restored when you step past the newest entry.
+    pub fn history_prev(&mut self) -> bool {
+        if self.prompt_history.is_empty() {
+            return false;
+        }
+        match self.history_idx {
+            None => {
+                self.history_draft = self.input.clone();
+                self.history_idx = Some(self.prompt_history.len() - 1);
+            }
+            Some(0) => {}
+            Some(i) => self.history_idx = Some(i - 1),
+        }
+        if let Some(i) = self.history_idx {
+            self.input = self.prompt_history[i].clone();
+            self.cursor = self.input.chars().count();
+            self.dismiss_ghost("dismissed-history");
+        }
+        true
+    }
+
+    /// Down — step forward; past the newest entry restores the draft.
+    pub fn history_next(&mut self) -> bool {
+        match self.history_idx {
+            None => false,
+            Some(i) if i + 1 < self.prompt_history.len() => {
+                self.history_idx = Some(i + 1);
+                self.input = self.prompt_history[i + 1].clone();
+                self.cursor = self.input.chars().count();
+                true
+            }
+            Some(_) => {
+                self.history_idx = None;
+                self.input = std::mem::take(&mut self.history_draft);
+                self.cursor = self.input.chars().count();
+                true
+            }
+        }
+    }
+
+    /// Liveness probe (2026-11-12): sample the CPU of pi's whole subprocess
+    /// tree at most every 2 s while a tool runs; flat samples accumulate
+    /// `liveness_flat_secs`. No-op when nothing runs.
+    pub fn probe_liveness(&mut self, pi_pid: Option<u32>) {
+        if !self.has_running_tool() {
+            self.liveness_cpu_total = 0.0;
+            self.liveness_prev_total = 0.0;
+            self.liveness_delta = 0.0;
+            self.liveness_flat_secs = 0;
+            self.liveness_sampled_at = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(t) = self.liveness_sampled_at {
+            if (now - t).as_secs_f64() < 2.0 {
+                return; // throttle: /proc walks are not free
+            }
+        }
+        let Some(total) = pi_pid.and_then(subtree_cpu_secs) else {
+            self.liveness_unavailable = true;
+            return;
+        };
+        self.liveness_delta = if self.liveness_sampled_at.is_some() {
+            (total - self.liveness_prev_total).max(0.0)
+        } else {
+            0.0
+        };
+        self.liveness_prev_total = total;
+        self.liveness_cpu_total = total;
+        self.liveness_sampled_at = Some(now);
+        if self.liveness_delta > 0.05 {
+            self.liveness_flat_secs = 0;
+        } else {
+            self.liveness_flat_secs += 2; // sample window
+        }
+        self.liveness_unavailable = false;
+    }
+
+    /// `(text, is_alive)` suffix for the running tool header. Empty when no
+    /// sample exists yet.
+    pub fn liveness_suffix(&self) -> Option<(String, bool)> {
+        if self.liveness_unavailable || self.liveness_sampled_at.is_none() {
+            return None;
+        }
+        if self.liveness_flat_secs == 0 {
+            Some((format!("cpu +{:.1}s", self.liveness_delta), true))
+        } else {
+            Some((format!("cpu flat {}s", self.liveness_flat_secs), false))
+        }
+    }
+
+    /// `/status` — snapshot the session facts once and open the modal.
+    pub fn status_open_modal(&mut self) {
+        self.note_phase(UiEvent::OpenModal);
+        self.status_lines = self.build_status_lines();
+        self.status_open = true;
+    }
+
+    pub fn status_close(&mut self) {
+        if self.status_open {
+            self.note_phase(UiEvent::CloseModal);
+            self.status_open = false;
+        }
+    }
+
+    /// Pure builder so tests pin the content without touching $HOME files.
+    /// `gateway`/`policy_note` come from the caduceus state + prefs files.
+    fn status_rows(
+        &self,
+        gateway: Option<(crate::tui::caduceus::CaduceusState, bool)>,
+        policy_line: Option<String>,
+        profile: Option<String>,
+    ) -> Vec<(&'static str, String)> {
+        let mut rows: Vec<(&'static str, String)> = Vec::new();
+        rows.push(("cwd", shorten_home_for_status(&self.cwd)));
+        rows.push((
+            "session",
+            self.session_name.clone().unwrap_or_else(|| {
+                format!("{}…", &self.session_id[..self.session_id.len().min(10)])
+            }),
+        ));
+        rows.push((
+            "model",
+            match &self.model {
+                Some(m) => match &m.name {
+                    Some(name) => format!("{} / {} · {}", m.provider, m.id, name),
+                    None => format!("{} / {}", m.provider, m.id),
+                },
+                None => "(none)".to_string(),
+            },
+        ));
+        rows.push((
+            "agent",
+            self.agent_mode_label
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+        ));
+        rows.push((
+            "profile",
+            profile.unwrap_or_else(|| "auto (default)".to_string()),
+        ));
+        rows.push((
+            "context",
+            self.ctx_bar_label()
+                .unwrap_or_else(|| "— (no report yet)".to_string()),
+        ));
+        rows.push(("permissions", self.perm_mode.clone()));
+        rows.push((
+            "gateway",
+            match gateway {
+                Some((s, up)) => {
+                    let stale = if s.is_stale(crate::tui::caduceus::now_ms()) {
+                        " · STALE"
+                    } else {
+                        ""
+                    };
+                    if up {
+                        format!(
+                            "up · {} free lanes · cooling {}{stale}",
+                            s.free_candidate_count(),
+                            s.cooling
+                        )
+                    } else {
+                        format!("DOWN{stale}")
+                    }
+                }
+                None => "no state file (caduceus extension idle?)".to_string(),
+            },
+        ));
+        rows.push((
+            "policy",
+            policy_line.unwrap_or_else(|| "prefs ignored".to_string()),
+        ));
+        rows
+    }
+
+    fn build_status_lines(&self) -> Vec<(&'static str, String)> {
+        let gateway = crate::tui::caduceus::load().map(|s| {
+            let up = s.gateway_up;
+            (s, up)
+        });
+        let (prefs, note) = crate::tui::caduceus::load_prefs();
+        let policy_line = match note {
+            Some(note) => format!("prefs ignored: {note}"),
+            None => format!(
+                "free_only={} · per_owner={} · max={}",
+                if prefs.free_only { "on" } else { "off" },
+                prefs.per_owner,
+                prefs.max_candidates
+            ),
+        };
+        let profile = std::fs::read_to_string(profile_path())
+            .ok()
+            .map(|p| p.trim().to_string());
+        self.status_rows(gateway, Some(policy_line), profile)
+    }
+
+    pub fn caduceus_close(&mut self) {
+        if self.caduceus.is_some() {
+            self.note_phase(UiEvent::CloseModal);
+            self.caduceus = None;
+        }
+    }
+
+    /// Extension notify (stage 3, 2026-11-12): errors/warnings land in the
+    /// transcript as Diag; info keeps the 40-char glance row, and anything
+    /// the truncation would mangle (multi-line tables or >100-char payloads)
+    /// is ALSO captured as a Notice entry so /free, /nimbus, /phase-models
+    /// output is actually readable.
+    pub fn apply_notify(&mut self, msg: &str, ntype: &str) {
+        // Watchdog observations are not errors — give them their own block.
+        if msg.starts_with("hang-watchdog") {
+            let path = self.watchdog_file.clone().unwrap_or_else(watchdog_path);
+            self.watchdog = load_watchdog_doc_at(&path);
+            self.entries.push(ChatEntry::Watchdog(msg.to_string()));
+            return;
+        }
+        if ntype == "error" || ntype == "warning" {
+            self.entries.push(ChatEntry::Diag(msg.to_string()));
+        } else {
+            self.notice = Some((msg.to_string(), ntype.to_string()));
+            if msg.contains('\n') || msg.len() > 100 {
+                self.entries.push(ChatEntry::Notice(msg.to_string()));
+            }
+        }
     }
 
     pub fn cache_delete_selected(&mut self) {
@@ -1168,6 +1917,78 @@ impl AppState {
     }
 
     /// `/cache` command surface. Bare opens the manager modal.
+    /// `/thinking-view [hide|show]` — display-only toggle (the model's
+    /// thinking LEVEL stays with pi's /thinking). Bare = status.
+    pub fn thinking_view_command(&mut self, args: &str) {
+        match args.trim() {
+            "" => self.entries.push(ChatEntry::Diag(format!(
+                "thinking display: {} — /thinking-view hide|show",
+                if self.hide_thinking {
+                    "hidden"
+                } else {
+                    "shown"
+                }
+            ))),
+            "hide" | "hidden" | "off" => {
+                self.hide_thinking = true;
+                persist_hide_thinking(self);
+                self.entries.push(ChatEntry::Diag(
+                    "thinking display: hidden (collapsed markers; /thinking-view show)".into(),
+                ));
+            }
+            "show" | "shown" | "on" => {
+                self.hide_thinking = false;
+                persist_hide_thinking(self);
+                self.entries
+                    .push(ChatEntry::Diag("thinking display: shown".into()));
+            }
+            other => self.entries.push(ChatEntry::Diag(format!(
+                "thinking-view: unknown '{other}' — use hide | show"
+            ))),
+        }
+    }
+
+    /// `/janitor [dry]` — plan (and by default apply) stale-artifact cleanup.
+    /// Dry mode lists what WOULD go; never touches protected paths.
+    pub fn janitor_command(&mut self, dry: bool) {
+        let plan = crate::tui::janitor::plan(
+            &crate::tui::janitor::Roots::live(),
+            std::time::SystemTime::now(),
+        );
+        if plan.items.is_empty() {
+            self.entries
+                .push(ChatEntry::Diag("janitor: nothing stale — all clean".into()));
+            return;
+        }
+        if dry {
+            self.entries.push(ChatEntry::Diag(format!(
+                "janitor (dry): {} item(s) · {} would be removed",
+                plan.items.len(),
+                crate::tui::cache::fmt_bytes(plan.bytes())
+            )));
+            for item in plan.items.iter().take(12) {
+                self.entries.push(ChatEntry::Diag(format!(
+                    "  {} · {} · {}",
+                    item.reason,
+                    crate::tui::cache::fmt_bytes(item.bytes),
+                    item.path.display()
+                )));
+            }
+            if plan.items.len() > 12 {
+                self.entries.push(ChatEntry::Diag(format!(
+                    "  … {} more",
+                    plan.items.len() - 12
+                )));
+            }
+            return;
+        }
+        let (count, bytes) = crate::tui::janitor::apply(&plan.items);
+        self.entries.push(ChatEntry::Diag(format!(
+            "janitor: removed {count} item(s) · {}",
+            crate::tui::cache::fmt_bytes(bytes)
+        )));
+    }
+
     pub fn cache_command(&mut self, args: &str) {
         let args = args.trim();
         if args.is_empty() {
@@ -1206,6 +2027,11 @@ impl AppState {
             self.model = Some(m);
         }
         self.thinking_level = thinking_level;
+        if is_streaming && !self.is_streaming {
+            self.turn_started_at = Some(std::time::Instant::now());
+        } else if !is_streaming {
+            self.turn_started_at = None;
+        }
         self.is_streaming = is_streaming;
         self.is_compacting = is_compacting;
         self.session_id = session_id.unwrap_or_default();
@@ -1215,6 +2041,7 @@ impl AppState {
 
     /// Append a text delta to the last assistant entry (or open a new one).
     pub fn push_text_delta(&mut self, delta: &str) {
+        self.stream_heat = (self.stream_heat + 0.4).min(1.6);
         match self.entries.last_mut() {
             Some(ChatEntry::Assistant(t)) => t.push_str(delta),
             _ => self.entries.push(ChatEntry::Assistant(delta.to_string())),
@@ -1223,6 +2050,7 @@ impl AppState {
 
     /// Append a thinking delta to the last thinking entry (or open a new one).
     pub fn push_thinking_delta(&mut self, delta: &str) {
+        self.stream_heat = (self.stream_heat + 0.4).min(1.6);
         match self.entries.last_mut() {
             Some(ChatEntry::Thinking(t)) => t.push_str(delta),
             _ => self.entries.push(ChatEntry::Thinking(delta.to_string())),
@@ -1444,6 +2272,7 @@ impl AppState {
         if key == "engine-fire" {
             // Machine-readable load line from vitriol-decode: "FIRE 0.731".
             // Not sidebar content — the flames are the display.
+            self.engine_fire_seen = Some(std::time::Instant::now());
             for line in &lines {
                 let plain = strip_ansi(line);
                 if let Some(rest) = plain.strip_prefix("FIRE ") {
@@ -1585,9 +2414,78 @@ impl AppState {
     /// Advance the fire's low-pass — exponential smoothing with a ≈0.33 s
     /// time constant, so the flame breathes at the same tempo regardless of
     /// frame rate.
+    /// Record real activity (call on any streamed text, tool event, agent
+    /// transition, or prompt submit).
+    pub fn mark_activity(&mut self) {
+        self.last_activity = Some(std::time::Instant::now());
+    }
+
+    /// Is the session actually doing something? Fresh activity (≤10 s) OR
+    /// a running tool whose CPU burned in the last sample window.
+    pub fn liveliness_active(&self) -> bool {
+        if self.has_running_tool()
+            && self.liveness_sampled_at.is_some()
+            && self.liveness_flat_secs == 0
+        {
+            return true;
+        }
+        match self.last_activity {
+            Some(t) => t.elapsed().as_secs() < 10,
+            None => false,
+        }
+    }
+
+    /// Seconds since the last real signal (0 when none ever, for display).
+    /// Seconds since the turn began (stamped when streaming starts).
+    pub fn turn_elapsed_secs(&self) -> u64 {
+        self.turn_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    pub fn stalled_secs(&self) -> u64 {
+        self.last_activity
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Seconds until the next watchdog check (None when no watch is armed
+    /// or the facts are stale/consumed).
+    pub fn watchdog_countdown(&self) -> Option<u64> {
+        let doc = self.watchdog.as_ref()?;
+        let now = crate::tui::caduceus::now_ms();
+        if now.saturating_sub(doc.ts) > 120_000 || doc.next_check_at == 0 {
+            return None;
+        }
+        if doc.next_check_at <= now {
+            return Some(0);
+        }
+        Some((doc.next_check_at - now) / 1000)
+    }
+
+    /// Fire gate (I1): no evidence → flames are dying/dead. Called from the
+    /// run loop before stepping the animation.
+    pub fn apply_liveliness_gate(&mut self) {
+        if !self.liveliness_active() {
+            self.fire_target = 0.0;
+        }
+    }
+
     pub fn step_fire(&mut self, dt_secs: f64) {
         if !self.fire_on {
             self.fire_target = 0.0;
+        }
+        // Cloud/stream fallback (2026-11-13): when the engine-fire telemetry
+        // is stale or absent (engine down, cloud lane), the flames derive
+        // from STREAM deltas — they genuinely reflect token flow and decay
+        // when the stream stalls. Fresh engine telemetry always wins.
+        let engine_telemetry_fresh = self
+            .engine_fire_seen
+            .map(|t| t.elapsed().as_secs() < 15)
+            .unwrap_or(false);
+        if !engine_telemetry_fresh && self.is_streaming {
+            self.stream_heat *= (-dt_secs / 1.5).exp();
+            self.fire_target = (0.35 + 0.55 * self.stream_heat.min(1.0)).clamp(0.0, 1.0);
         }
         let k = 1.0 - (-dt_secs / 0.33).exp();
         self.fire_level += (self.fire_target - self.fire_level) * k;
@@ -1719,6 +2617,14 @@ impl AppState {
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
         let total = self.entries.len();
+        let mut liveness = self.liveness_suffix();
+        if let Some(secs) = self.watchdog_countdown() {
+            liveness = Some(match liveness {
+                Some((text, alive)) => (format!("{text} \u{00b7} watch {secs}s"), alive),
+                None => (format!("watch {secs}s"), true),
+            });
+        }
+        let wd = self.watchdog.clone();
         for (idx, entry) in self.entries.iter_mut().enumerate() {
             let before = lines.len();
             match entry {
@@ -1769,6 +2675,44 @@ impl AppState {
                     }
                 }
                 ChatEntry::Thinking(text) => {
+                    if self.hide_thinking {
+                        let n = text.chars().count();
+                        // Liveliness (2026-11-13): while this block is the
+                        // live tail and the session is streaming, the marker
+                        // animates — visible proof the model is thinking,
+                        // even with the text hidden and on any lane.
+                        let growing = self.is_streaming && idx + 1 == total;
+                        let spinner = if growing {
+                            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                            let f =
+                                (self.started.elapsed().as_millis() / 120) as usize % frames.len();
+                            format!("{} ", frames[f])
+                        } else {
+                            String::new()
+                        };
+                        let count_style = if growing {
+                            Style::default().fg(theme::GOLD)
+                        } else {
+                            Style::default().fg(theme::MUTED)
+                        };
+                        let label = if growing {
+                            "thinking…"
+                        } else {
+                            "thinking hidden"
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "  ·    {spinner}{label} ({}) — /thinking-view show",
+                                if n >= 1000 {
+                                    format!("{:.1}k chars", n as f64 / 1000.0)
+                                } else {
+                                    format!("{n} chars")
+                                }
+                            ),
+                            count_style,
+                        )));
+                        continue;
+                    }
                     for seg in wrap_text(text, width.saturating_sub(8)) {
                         lines.push(Line::from(vec![
                             Span::styled("  ·    ", Style::default().fg(theme::MUTED)),
@@ -1892,6 +2836,7 @@ impl AppState {
                                 elapsed,
                                 *timeout_s,
                                 no_output_hint,
+                                liveness.clone(),
                             );
                             *render_cache = Some((body_w, gen, olen, tick, block));
                         }
@@ -1925,6 +2870,124 @@ impl AppState {
                         }
                     }
                 }
+                ChatEntry::Notice(text) => {
+                    let st = Style::new().fg(theme::VIOLET).bg(theme::BG);
+                    for (i, seg) in wrap_text(text, width.saturating_sub(8))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if i == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("  {} ", theme::GLYPH_HERM), st),
+                                Span::styled(seg, st),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::raw("        "),
+                                Span::styled(seg, st),
+                            ]));
+                        }
+                    }
+                }
+                ChatEntry::Watchdog(text) => {
+                    // Structured card when the facts file is fresh; raw text
+                    // fallback so a message is never lost (I3).
+                    let edge = Style::new().fg(theme::ORANGE).bg(theme::BG);
+                    let body = Style::new().fg(theme::TEXT).bg(theme::BG);
+                    let muted = Style::new().fg(theme::MUTED).bg(theme::BG);
+                    let span_w = width.saturating_sub(4) as usize;
+                    let (chip, chip_style) = match wd.as_ref().map(|d| d.verdict.as_str()) {
+                        Some("ALIVE") => (
+                            " ALIVE ",
+                            Style::new()
+                                .fg(theme::GREEN)
+                                .bg(theme::BG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Some("HUNG") => (
+                            " HUNG ",
+                            Style::new()
+                                .fg(theme::ORANGE)
+                                .bg(theme::BG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Some("JUDGING") => (
+                            " JUDGING ",
+                            Style::new()
+                                .fg(theme::GOLD)
+                                .bg(theme::BG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        _ => ("", muted),
+                    };
+                    let label = " \u{23f1} watch ";
+                    let right = if chip.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {chip}")
+                    };
+                    let dashes =
+                        span_w.saturating_sub(label.chars().count() + right.chars().count() + 1);
+                    lines.push(Line::from(vec![
+                        Span::styled("  \u{256d}\u{2500}", edge),
+                        Span::styled(
+                            label,
+                            Style::new()
+                                .fg(theme::ORANGE)
+                                .bg(theme::BG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("\u{2500}".repeat(dashes.min(60)), edge),
+                        Span::styled(right, chip_style),
+                        Span::styled("\u{2500}\u{256e}", edge),
+                    ]));
+                    match wd.as_ref() {
+                        Some(doc) if !doc.command.is_empty() => {
+                            let field = |k: &str, v: String| {
+                                Line::from(vec![
+                                    Span::styled("  \u{2502} ", edge),
+                                    Span::styled(format!("{k:<9}"), muted),
+                                    Span::styled(trunc_str(&v, width.saturating_sub(13)), body),
+                                ])
+                            };
+                            lines.push(field("cmd", doc.command.clone()));
+                            lines.push(field(
+                                "elapsed",
+                                format!(
+                                    "{}m {:02}s \u{00b7} stalled {}s",
+                                    doc.elapsed_s / 60,
+                                    doc.elapsed_s % 60,
+                                    doc.stalled_s
+                                ),
+                            ));
+                            if !doc.reason.is_empty() {
+                                lines.push(field("reason", doc.reason.clone()));
+                            }
+                            let hint = match doc.verdict.as_str() {
+                                "ALIVE" => "compiling/working \u{2014} no action needed",
+                                "HUNG" => "esc aborts if you agree \u{00b7} no auto-kill",
+                                _ => "judging on a free lane \u{00b7} no auto-kill",
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled("  \u{2502} ", edge),
+                                Span::styled(hint.to_string(), muted),
+                            ]));
+                        }
+                        _ => {
+                            for seg in wrap_text(text, width.saturating_sub(7)) {
+                                lines.push(Line::from(vec![
+                                    Span::styled("  \u{2502} ", edge),
+                                    Span::styled(seg, body),
+                                ]));
+                            }
+                        }
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("  \u{2570}", edge),
+                        Span::styled("\u{2500}".repeat(span_w.saturating_sub(1)), edge),
+                        Span::styled("\u{256f}", edge),
+                    ]));
+                }
             }
             // Breathing room between transcript entries (owner request
             // 2026-11-10: everything was bunched). Exactly one blank row,
@@ -1947,12 +3010,20 @@ impl AppState {
     /// (name, short — menu row, long — popup detail line + /help).
     /// Shorts stay ≤ ~40 cols; longs carry the full usage.
     pub const LOCAL_COMMANDS: &[(&str, &str, &str)] = &[
+        ("cost", "routing ledger", "/cost — today's route ledger: requests, tokens in/out, failures per provider/model + budget bars (read-only)"),
+        ("sessions", "all projects", "/sessions — search + resume sessions across every project store (foreign projects are read-only hints; I4)"),
+        ("review-findings", "review results", "/review-findings — the last /review findings, severity-sorted (read-only; written by /review)"),
+        ("janitor", "stale cache cleanup", "/janitor [dry] — remove stale prompt/watchdog/longjob/probe/KV/session-chain artifacts (protected: newest store file, slot0.bin, corrupt quarantines, ledgers); auto-runs daily"),
+        ("thinking-view", "hide thinking blocks", "/thinking-view [hide|show] — collapse thinking blocks to a marker line (display only; the model's thinking level stays at /thinking)"),
+        ("fx", "fire + glimmer", "/fx — fire/glimmer panel with live preview (fire only animates while the session is actually working)"),
+        ("answers", "last inquiry answer", "/answers — the last INQUIRE-mode question + answer (scrollable; written by the agent-mode extension)"),
+        ("engine", "engine control", "/engine [start|stop|restart|status] — control the vitriol-server systemd unit (no sudo: polkit scopes you to the two vitriol units; your daily-driver config is untouched)"),
+        ("status", "session snapshot", "/status — model, agent, profile, context fill, cwd, session, permissions, gateway lanes, routing policy (read-only)"),
+        ("caduceus", "gateway + routing", "/caduceus — providers/models/health/policy page: routing on-off, ranks, pins, free-only, caps (facts by the caduceus extension; policy file written by the TUI)"),
         ("cache", "manage the KV cache", "/cache — list engine KV cache entries with age/size; /cache wipe [age] — prune (slot0.bin protected)"),
         ("clear", "clear the transcript", "/clear — wipe the local transcript view (pi keeps the session history)"),
         ("compact", "compact the context", "/compact [hints] — summarize older history now; after it settles, auto-continue picks the work back up"),
         ("diag", "toggle diagnostics", "/diag or F9 — stderr overlay from the agent process"),
-        ("fire", "composer flames", "/fire [on|off|style|tint|<voice>] — voices: prismatic, emerald, alchemy; tint toggles whether flames discolor standing text"),
-        ("glimmer", "watermark glimmer", "/glimmer [shimmer|breathe|twinkle|off] — bare cycles"),
         ("help", "glossary + keys + commands", "/help or F1 — the reference modal"),
         ("clone", "duplicate the session", "/clone — duplicate the active branch into a fresh session"),
         ("export", "export session to HTML", "/export [path] — write a self-contained HTML transcript"),
@@ -1960,7 +3031,7 @@ impl AppState {
         ("sidebar", "cycle sidebar visibility", "/sidebar — auto (hide when narrow) → show → hide"),
         ("permissions", "permission mode", "/permissions — ask | auto | yolo (sensitive roots always guarded)"),
         ("yolo", "toggle YOLO mode", "/yolo — toggle ask <-> yolo (sensitive roots still prompt)"),
-        ("opencode", "import an OpenCode session", "/opencode [latest|<id>|list] [full] — convert an OpenCode session for this project and switch to it"),
+        ("import-opencode", "import an OpenCode session", "/import-opencode [latest|<id>|list] [full] — convert an OpenCode session for this project and switch to it"),
         ("model", "select a model", "/model [provider/id] — picker from available models; provider/id switches directly"),
         ("new", "new session", "/new — fresh session (old one stays resumable)"),
         ("quit", "quit the TUI", "/quit — deliberate quit; the only other path is ^esc"),
@@ -2484,6 +3555,121 @@ fn shell_args_lines(
 /// Block shows a one-line args summary and a preview slice of the output;
 /// Full shows the complete pretty-printed args JSON and (near-)all output,
 /// with a live tail while the tool is running. `width` is the box budget.
+/// Codex-QoL stage 5: does this output look like a unified diff? Header
+/// markers win outright; otherwise a strong +/- majority over >=2 lines.
+fn looks_like_diff(lines: &[String]) -> bool {
+    let header = lines.iter().take(8).any(|l| {
+        let t = l.trim_start();
+        t.starts_with("diff --git")
+            || t.starts_with("+++")
+            || (t.starts_with("--- ") && t.len() > 4)
+            || t.starts_with("@@")
+            || t.starts_with("index ")
+    });
+    if header {
+        return true;
+    }
+    if lines.len() < 2 {
+        return false;
+    }
+    let pm = lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with('+') || t.starts_with('-')
+        })
+        .count();
+    pm * 2 > lines.len()
+}
+
+/// Style one diff line: @@ hunks gold, +++/--- file headers muted,
+/// additions green, deletions red, context default.
+fn diff_line_style(line: &str, default: Style) -> Style {
+    let t = line.trim_start();
+    if t.starts_with("@@") {
+        Style::default().fg(theme::GOLD).bg(theme::BG)
+    } else if t.starts_with("+++") || t.starts_with("---") {
+        Style::default().fg(theme::MUTED).bg(theme::BG)
+    } else if t.starts_with('+') {
+        Style::default().fg(theme::GREEN).bg(theme::BG)
+    } else if t.starts_with('-') {
+        Style::default().fg(theme::RED).bg(theme::BG)
+    } else {
+        default
+    }
+}
+
+/// Human-readable args for tools without a purpose-built renderer: one
+/// line per key, values unquoted/shortened; objects fall back to compact
+/// JSON, arrays collapse to a comma list or "[N items]". Max 6 rows.
+fn generic_args_lines(
+    args: &serde_json::Value,
+    width: usize,
+    surf: ratatui::style::Color,
+    muted_st: Style,
+    text_st: Style,
+) -> Vec<Line<'static>> {
+    let border = Style::default().fg(theme::MUTED).bg(surf);
+    let mut lines = Vec::new();
+    let Some(obj) = args.as_object() else {
+        let one = serde_json::to_string(args).unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled("│ ", border),
+            Span::styled(trunc_str(&one, width.saturating_sub(4)), text_st),
+        ]));
+        return lines;
+    };
+    let budget = width.saturating_sub(18);
+    let mut shown = 0usize;
+    for (k, v) in obj {
+        if v.is_null() || (v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)) {
+            continue;
+        }
+        if shown >= 6 {
+            let rest = obj.len().saturating_sub(shown);
+            if rest > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("│ ", border),
+                    Span::styled(format!("… {rest} more"), muted_st),
+                ]));
+            }
+            break;
+        }
+        let value = match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Array(items) => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .take(6)
+                    .map(|i| match i {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                let joined = parts.join(", ");
+                if items.len() > 6 {
+                    format!("{joined}, … (+{} more)", items.len() - 6)
+                } else {
+                    joined
+                }
+            }
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("│ ", border),
+            Span::styled(
+                format!("{:<14}", trunc_str(&trunc_str(k, 14), 14)),
+                muted_st,
+            ),
+            Span::styled(trunc_str(value.trim(), budget), text_st),
+        ]));
+        shown += 1;
+    }
+    lines
+}
+
 fn render_tool_block(
     mode: ToolVerbosity,
     name: &str,
@@ -2497,6 +3683,7 @@ fn render_tool_block(
     elapsed: Option<u64>,
     timeout_s: Option<u64>,
     no_output_hint: bool,
+    liveness: Option<(String, bool)>,
 ) -> Vec<Line<'static>> {
     let full = mode == ToolVerbosity::Full;
     // The panel is an OPAQUE PLATE (owner request 2026-09-03: fire must
@@ -2571,17 +3758,9 @@ fn render_tool_block(
                 }
             }
         } else {
-            let one = serde_json::to_string(a).unwrap_or_default();
-            let compact = if summary.is_empty() {
-                one
-            } else {
-                format!("{} {}", summary, one)
-            };
-            lines.push(Line::from(vec![
-                Span::styled("│ ", border),
-                Span::styled("args  ", muted_st),
-                Span::styled(trunc_str(compact.trim(), width.saturating_sub(9)), text_st),
-            ]));
+            // Generic tools: key/value lines instead of a raw JSON blob
+            // (owner request 2026-11-13).
+            lines.extend(generic_args_lines(a, width, surf, muted_st, text_st));
         }
     }
 
@@ -2606,7 +3785,15 @@ fn render_tool_block(
         } else {
             output
         };
+        // Codex-QoL stage 5: diff-shaped output (git diff, edit/write
+        // results) gets +/-/@@ line coloring; everything else unchanged.
+        let is_diff = looks_like_diff(slice);
         for ol in slice {
+            let line_st = if is_diff {
+                diff_line_style(ol, text_st)
+            } else {
+                text_st
+            };
             for (i, seg) in wrap_text(ol, width.saturating_sub(5))
                 .into_iter()
                 .enumerate()
@@ -2614,7 +3801,7 @@ fn render_tool_block(
                 let prefix = if i == 0 { "│   " } else { "│   " };
                 lines.push(Line::from(vec![
                     Span::styled(prefix, border),
-                    Span::styled(seg, text_st),
+                    Span::styled(seg, line_st),
                 ]));
             }
         }
@@ -2644,6 +3831,18 @@ fn render_tool_block(
                 format!(" {}", fmt_elapsed(secs)),
                 Style::default().fg(theme::ORANGE).bg(surf),
             ));
+        }
+        // Liveness evidence (2026-11-12): real CPU from pi's subprocess
+        // tree — proof the work is alive even with output redirected to
+        // logs. Green when the tree burned CPU in the last window, amber
+        // when it has been flat.
+        if let Some((text, alive)) = liveness {
+            let st = if alive {
+                Style::default().fg(theme::GREEN).bg(surf)
+            } else {
+                Style::default().fg(theme::ORANGE).bg(surf)
+            };
+            spans.push(Span::styled(format!(" · {text}"), st));
         }
         lines.push(Line::from(spans));
         if no_output_hint {
@@ -2754,7 +3953,7 @@ fn trunc_str(s: &str, w: usize) -> String {
 }
 
 /// Greedy word wrap returning owned strings.
-fn wrap_text(s: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_text(s: &str, width: usize) -> Vec<String> {
     let width = width.max(10);
     if s.is_empty() {
         return vec![String::new()];
@@ -2800,6 +3999,563 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_info_long_or_multiline_captures_notice_entry() {
+        // stage 3 (2026-11-12): tables were invisible past the 40-char row
+        let mut s = AppState::default();
+        let table = "lane-a · 32k\nlane-b · 128k\nlane-c · 8k";
+        s.apply_notify(table, "info");
+        assert!(s.notice.is_some(), "glance row still set");
+        assert_eq!(s.entries.len(), 1);
+        let ChatEntry::Notice(t) = &s.entries[0] else {
+            panic!("expected Notice entry, got {:?}", s.entries[0]);
+        };
+        assert!(t.contains("lane-b · 128k"));
+
+        let long = "x".repeat(101);
+        s.apply_notify(&long, "info");
+        assert!(matches!(s.entries.last(), Some(ChatEntry::Notice(_))));
+    }
+
+    #[test]
+    fn notify_info_short_stays_transient() {
+        let mut s = AppState::default();
+        s.apply_notify("coupled: Lapis Occultus", "info");
+        assert_eq!(s.entries.len(), 0, "short info must not spam transcript");
+        assert_eq!(
+            s.notice.as_ref().map(|(m, _)| m.as_str()),
+            Some("coupled: Lapis Occultus")
+        );
+    }
+
+    #[test]
+    fn notify_warning_and_error_land_as_diag() {
+        let mut s = AppState::default();
+        s.apply_notify("engine down", "warning");
+        s.apply_notify("checkpoint failed", "error");
+        assert_eq!(s.entries.len(), 2);
+        assert!(matches!(s.entries[0], ChatEntry::Diag(_)));
+        assert!(matches!(s.entries[1], ChatEntry::Diag(_)));
+        assert!(s.notice.is_none(), "errors do not use the glance row");
+    }
+
+    #[test]
+    fn diff_detection_and_line_styles() {
+        // codex-qol stage 5
+        let diff: Vec<String> = vec![
+            "diff --git a/x.rs b/x.rs".into(),
+            "--- a/x.rs".into(),
+            "+++ b/x.rs".into(),
+            "@@ -1,3 +1,4 @@".into(),
+            " context line".into(),
+            "-old line".into(),
+            "+new line".into(),
+        ];
+        assert!(looks_like_diff(&diff));
+        let bash: Vec<String> = vec![
+            "cargo build --release -p officina".into(),
+            "   Compiling x".into(),
+        ];
+        assert!(!looks_like_diff(&bash));
+        let lone: Vec<String> = vec!["-x".into()];
+        assert!(!looks_like_diff(&lone));
+        let majority: Vec<String> = vec!["+a".into(), "-b".into(), "+c".into(), "ctx".into()];
+        assert!(looks_like_diff(&majority));
+
+        let base = Style::default().fg(theme::TEXT);
+        assert_eq!(diff_line_style("+add", base).fg, Some(theme::GREEN));
+        assert_eq!(diff_line_style("-del", base).fg, Some(theme::RED));
+        assert_eq!(diff_line_style("@@ hunk", base).fg, Some(theme::GOLD));
+        assert_eq!(diff_line_style("+++ b/x", base).fg, Some(theme::MUTED));
+        assert_eq!(diff_line_style("context", base), base);
+    }
+
+    #[test]
+    fn editor_staging_preserves_the_draft() {
+        // codex-qol stage 4 (I4): staging never loses the draft
+        let mut s = AppState::default();
+        s.input = "refactor the flux capacitor\nsecond line".into();
+        s.stage_editor("nvim -f");
+        let (argv, tmp, original) = s.editor_suspend.take().expect("staged");
+        assert_eq!(argv[0], "nvim");
+        assert_eq!(argv[1], "-f");
+        assert!(argv[2].ends_with(".md"));
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), original);
+        assert_eq!(original, "refactor the flux capacitor\nsecond line");
+        let _ = std::fs::remove_file(&tmp);
+        // empty editor string refuses without staging
+        s.stage_editor("   ");
+        assert!(s.editor_suspend.is_none());
+        assert!(s.notice.is_some());
+    }
+
+    #[test]
+    fn resume_filter_narrows_and_clamps() {
+        // codex-qol stage 3
+        use crate::rpc::sessions::SessionEntry;
+        let mut s = AppState::default();
+        let mk = |title: &str, p: &str| SessionEntry {
+            path: std::path::PathBuf::from(p),
+            title: title.to_string(),
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            msg_count: 1,
+        };
+        s.resume_entries = vec![
+            mk("fix the flux capacitor", "/s/a.jsonl"),
+            mk("refactor dashboard", "/s/b.jsonl"),
+            mk("investigate flaky tests", "/s/c.jsonl"),
+        ];
+        assert_eq!(s.filtered_resume_entries().len(), 3);
+        s.resume_filter = "fl".into();
+        let names: Vec<String> = s
+            .filtered_resume_entries()
+            .iter()
+            .map(|e| e.title.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["fix the flux capacitor", "investigate flaky tests"]
+        );
+        s.resume_sel = 9;
+        s.clamp_resume_sel();
+        assert_eq!(s.resume_sel, 1);
+        s.resume_filter = "zzz".into();
+        s.clamp_resume_sel();
+        assert_eq!(s.resume_sel, 0);
+    }
+
+    #[test]
+    fn watchdog_notifies_get_their_own_block() {
+        // 2026-11-13: warnings from the watchdog are observations, not diags
+        let mut s = AppState::default();
+        s.watchdog_file = Some(std::path::PathBuf::from("/nonexistent/watchdog.json"));
+        s.apply_notify(
+            "hang-watchdog: \"brievc build\" — no output for 61s (61s total)",
+            "warning",
+        );
+        assert_eq!(s.entries.len(), 1);
+        assert!(matches!(s.entries[0], ChatEntry::Watchdog(_)));
+        assert!(
+            s.notice.is_none(),
+            "watchdog entries do not use the glance row"
+        );
+        // normal warnings still become Diag
+        let mut s2 = AppState::default();
+        s2.apply_notify("engine down", "warning");
+        assert!(matches!(s2.entries[0], ChatEntry::Diag(_)));
+        // the block renders with its label
+        let text = s
+            .chat_lines(80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("watch"), "watchdog label: {text}");
+        assert!(text.contains("no output for 61s"));
+    }
+
+    #[test]
+    fn quit_guard_arms_only_when_busy() {
+        // 2026-11-13: restart-mid-turn manufactured session patches — the
+        // guard makes that a deliberate two-press decision instead.
+        let mut s = AppState::default();
+        // idle: proceeds immediately
+        assert!(s.quit_may_proceed());
+        // busy + not armed: first press arms, does not proceed
+        s.is_streaming = true;
+        assert!(!s.quit_may_proceed());
+        assert!(s.quit_armed_at.is_some(), "armed");
+        // second press inside the 5 s window: proceeds, disarms
+        assert!(s.quit_may_proceed());
+        assert!(s.quit_armed_at.is_none());
+        // re-arm then let the window expire (>5 s): still blocked
+        assert!(!s.quit_may_proceed());
+        s.quit_armed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(6));
+        assert!(!s.quit_may_proceed(), "expired arm re-arms");
+        // not streaming anymore: proceeds and disarms
+        s.is_streaming = false;
+        assert!(s.quit_may_proceed());
+        assert!(s.quit_armed_at.is_none());
+    }
+
+    #[test]
+    fn watchdog_card_parses_and_counts_down() {
+        // 2026-11-13: structured fields + "watch Ns" countdown
+        let now = crate::tui::caduceus::now_ms();
+        let doc: WatchdogDoc = serde_json::from_str(&format!(
+            r#"{{"version":1,"ts":{},"kind":"verdict","command":"brievc build c4probe.bv",
+                 "elapsed_s":252,"stalled_s":189,"verdict":"HUNG","reason":"waiting on stdin",
+                 "next_check_at":{},"phase":"rejudge"}}"#,
+            now,
+            now + 21_000
+        ))
+        .expect("parses");
+        let mut s = AppState::default();
+        s.watchdog = Some(doc.clone());
+        let secs = s.watchdog_countdown().expect("countdown armed");
+        assert!((20..=21).contains(&secs), "countdown ~21s, got {secs}");
+        // facts older than 2 min are ignored
+        s.watchdog = Some(WatchdogDoc {
+            ts: now.saturating_sub(180_000),
+            ..doc.clone()
+        });
+        assert!(s.watchdog_countdown().is_none());
+        // consumed watch (next_check_at 0) has no countdown
+        s.watchdog = Some(WatchdogDoc {
+            next_check_at: 0,
+            ..doc
+        });
+        assert!(s.watchdog_countdown().is_none());
+        // the card renders fields, not prose
+        let mut s2 = AppState::default();
+        s2.watchdog_file = Some(std::path::PathBuf::from("/nonexistent/watchdog.json"));
+        s2.apply_notify("hang-watchdog verdict: HUNG", "warning");
+        // apply_notify reloads facts from disk (absent in tests) — inject
+        // the parsed doc after, which is the same state production reaches
+        // when the file is fresh.
+        s2.watchdog = Some(
+            serde_json::from_str(&format!(
+                r#"{{"version":1,"ts":{now},"kind":"verdict","command":"brievc build c4probe.bv",
+                 "elapsed_s":252,"stalled_s":189,"verdict":"HUNG","reason":"waiting on stdin",
+                 "next_check_at":0,"phase":"done"}}"#
+            ))
+            .unwrap(),
+        );
+        let text = s2
+            .chat_lines(80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("HUNG"), "verdict chip: {text}");
+        assert!(text.contains("brievc build"), "cmd field: {text}");
+        assert!(text.contains("4m 12s"), "elapsed field: {text}");
+        assert!(text.contains("waiting on stdin"), "reason field: {text}");
+        assert!(text.contains("esc aborts"), "hint: {text}");
+    }
+
+    #[test]
+    fn flames_derive_from_stream_when_engine_telemetry_absent() {
+        // 2026-11-13: cloud-lane turns (engine down) get honest flames from
+        // token flow — deltas burn, a stalled stream decays to nothing.
+        let mut s = AppState::default();
+        s.fire_on = true;
+        s.is_streaming = true;
+        s.mark_activity();
+        // no engine-fire telemetry ever seen → stream-derived
+        s.push_text_delta("token ");
+        s.step_fire(0.1);
+        assert!(s.fire_target > 0.3, "stream deltas burn: {}", s.fire_target);
+        // deltas stop → heat decays, target falls to the quiet floor
+        for _ in 0..12 {
+            s.step_fire(0.5);
+        }
+        assert!(
+            s.fire_target < 0.5,
+            "decayed after silence: {}",
+            s.fire_target
+        );
+        // fresh engine telemetry takes precedence over the stream fallback:
+        // step_fire must not touch the telemetry-driven target
+        s.set_widget("engine-fire", vec!["FIRE 0.9".to_string()]);
+        s.stream_heat = 1.5;
+        s.fire_target = 0.9;
+        s.step_fire(0.1);
+        assert_eq!(s.fire_target, 0.9, "telemetry wins when fresh");
+    }
+
+    #[test]
+    fn liveliness_gate_fire_by_evidence() {
+        // 2026-11-13: animations never run without a real signal
+        let mut s = AppState::default();
+        assert!(!s.liveliness_active(), "fresh state has no evidence");
+        s.fire_target = 0.9;
+        s.apply_liveliness_gate();
+        assert_eq!(s.fire_target, 0.0, "stalled → flames die");
+
+        s.mark_activity();
+        assert!(s.liveliness_active(), "fresh signal is active");
+        s.fire_target = 0.7;
+        s.apply_liveliness_gate();
+        assert_eq!(s.fire_target, 0.7, "active → flames allowed");
+
+        // stale signal (11 s old) is stalled again
+        s.last_activity = Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+        assert!(!s.liveliness_active());
+        s.apply_liveliness_gate();
+        assert_eq!(s.fire_target, 0.0);
+    }
+
+    #[test]
+    fn liveliness_active_via_tool_cpu() {
+        let mut s = AppState::default();
+        s.tool_start(
+            Some("c"),
+            "bash",
+            &serde_json::json!({"command": "brievc build"}),
+        );
+        s.liveness_sampled_at = Some(std::time::Instant::now());
+        s.liveness_flat_secs = 0;
+        s.liveness_delta = 1.2;
+        s.last_activity = None;
+        assert!(s.liveliness_active(), "live tool CPU counts as evidence");
+        s.liveness_flat_secs = 120;
+        assert!(!s.liveliness_active(), "flat CPU for 120 s is a stall");
+    }
+
+    #[test]
+    fn prompt_history_navigation_and_draft_restore() {
+        // 2026-11-13: Up/Down through earlier prompts, draft preserved
+        let mut s = AppState::default();
+        s.prompt_history = vec!["first".into(), "second".into(), "third".into()];
+        s.input = "draft in progress".into();
+        assert!(s.history_prev());
+        assert_eq!(s.input, "third");
+        assert!(s.history_prev());
+        assert_eq!(s.input, "second");
+        assert!(s.history_prev());
+        assert_eq!(s.input, "first");
+        assert!(s.history_prev()); // clamp at oldest
+        assert_eq!(s.input, "first");
+        assert!(s.history_next());
+        assert_eq!(s.input, "second");
+        s.history_next();
+        s.history_next(); // past newest → draft restored
+        assert_eq!(s.input, "draft in progress");
+        assert!(s.history_idx.is_none());
+        assert!(!s.history_next());
+    }
+
+    #[test]
+    fn prompt_history_records_dedupes_and_caps() {
+        let mut s = AppState::default();
+        s.prompt_history.clear();
+        s.record_prompt_history("same");
+        s.record_prompt_history("same"); // consecutive dupe ignored
+        assert_eq!(s.prompt_history.len(), 1);
+        s.record_prompt_history("different");
+        assert_eq!(s.prompt_history.len(), 2);
+        for i in 0..250 {
+            s.record_prompt_history(&format!("p{i}"));
+        }
+        assert_eq!(s.prompt_history.len(), 200);
+        assert_eq!(s.prompt_history.last().unwrap(), "p249");
+    }
+
+    #[test]
+    fn generic_args_render_key_value_not_json() {
+        let base = Style::default().fg(theme::TEXT);
+        let muted = Style::default().fg(theme::MUTED);
+        let args = serde_json::json!({
+            "path": "src/main.rs",
+            "limit": 40,
+            "tags": ["a", "b"],
+            "nested": {"k": 1},
+            "empty": null,
+            "blank": ""
+        });
+        let lines = generic_args_lines(&args, 80, theme::PANEL, muted, base);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(text.contains("path"));
+        assert!(text.contains("src/main.rs"));
+        assert!(text.contains("40"));
+        assert!(text.contains("a, b"));
+        assert!(text.contains(r#"{"k":1}"#));
+        assert!(!text.contains("null"), "nulls skipped: {text}");
+        assert!(!text.contains(r#""path":"#), "no JSON key quoting: {text}");
+    }
+
+    #[test]
+    fn stat_cpu_ticks_parses_after_comm_parens() {
+        // comm with spaces/parens must not break field indexing
+        let raw = "12345 (brievc buil) S 1 1 1 0 -1 4194560 0 0 0 0 4200 800 0 0 20 0 1 0 12345 1 1 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        let t = stat_cpu_ticks(raw).expect("parses");
+        assert_eq!(t, 4200 + 800);
+        // 4200+800 ticks = 50.0 CPU-seconds at 100 Hz
+        let secs = t as f64 / CLK_TCK;
+        assert!((secs - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn liveness_suffix_reports_live_and_flat() {
+        let mut s = AppState::default();
+        assert!(s.liveness_suffix().is_none()); // no sample yet
+        s.liveness_sampled_at = Some(std::time::Instant::now());
+        s.liveness_delta = 3.2;
+        s.liveness_flat_secs = 0;
+        let (text, alive) = s.liveness_suffix().unwrap();
+        assert_eq!(text, "cpu +3.2s");
+        assert!(alive);
+        s.liveness_delta = 0.0;
+        s.liveness_flat_secs = 120;
+        let (text, alive) = s.liveness_suffix().unwrap();
+        assert_eq!(text, "cpu flat 120s");
+        assert!(!alive);
+        s.liveness_unavailable = true;
+        assert!(s.liveness_suffix().is_none());
+    }
+
+    #[test]
+    fn probe_resets_when_no_tool_runs() {
+        let mut s = AppState::default();
+        s.liveness_cpu_total = 42.0;
+        s.liveness_sampled_at = Some(std::time::Instant::now());
+        s.probe_liveness(None); // nothing running → reset
+        assert_eq!(s.liveness_cpu_total, 0.0);
+        assert!(s.liveness_sampled_at.is_none());
+    }
+
+    #[test]
+    fn ghost_lifecycle_accept_dismiss_telemetry() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("ghost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sug = dir.join("prompt-suggestion.json");
+        let events = dir.join("prompt-suggest-events.jsonl");
+        std::fs::write(
+            &sug,
+            r#"{"version":1,"id":"sug-1","text":"run the full verify suite","source":"llm","expires":0}"#,
+        )
+        .unwrap();
+        let mut s = AppState::default();
+        s.prompt_suggestion_file = Some(sug.clone());
+        s.ghost_events_file = Some(events.clone());
+        s.refresh_ghost();
+        assert_eq!(
+            s.prompt_ghost.as_ref().unwrap().text,
+            "run the full verify suite"
+        );
+        // dismissed id does not come back on refresh
+        s.input = String::new();
+        s.dismiss_ghost("dismissed-typed");
+        assert!(s.prompt_ghost.is_none());
+        s.refresh_ghost();
+        assert!(s.prompt_ghost.is_none());
+        s.ghost_dismissed_for = None;
+        s.refresh_ghost();
+        assert!(s.prompt_ghost.is_some());
+        // accept folds it into the draft and logs both verdicts
+        s.accept_ghost();
+        assert_eq!(s.input, "run the full verify suite");
+        assert_eq!(s.cursor, s.input.chars().count());
+        assert!(s.prompt_ghost.is_none());
+        let mut text = String::new();
+        std::fs::File::open(&events)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains("\"verdict\":\"dismissed-typed\""));
+        assert!(text.contains("\"verdict\":\"accepted\""));
+        assert!(
+            !text.contains("verify suite"),
+            "I4: no prompt text in telemetry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ghost_ignores_expired_corrupt_and_busy_states() {
+        let dir = std::env::temp_dir().join(format!("ghost2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sug = dir.join("prompt-suggestion.json");
+        let mut s = AppState::default();
+        s.prompt_suggestion_file = Some(sug.clone());
+        // corrupt
+        std::fs::write(&sug, "{nope").unwrap();
+        s.refresh_ghost();
+        assert!(s.prompt_ghost.is_none());
+        // expired
+        std::fs::write(
+            &sug,
+            format!(r#"{{"version":1,"id":"e","text":"x","source":"llm","expires":1}}"#),
+        )
+        .unwrap();
+        s.refresh_ghost();
+        assert!(s.prompt_ghost.is_none());
+        // busy composer never shows one
+        std::fs::write(
+            &sug,
+            r#"{"version":1,"id":"ok","text":"y","source":"llm","expires":0}"#,
+        )
+        .unwrap();
+        s.input = "operator text".into();
+        s.refresh_ghost();
+        assert!(s.prompt_ghost.is_none());
+        s.is_streaming = true;
+        s.input = String::new();
+        s.refresh_ghost();
+        assert!(s.prompt_ghost.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_rows_cover_session_facts() {
+        // codex-qol stage 2: read-only snapshot content
+        let mut s = AppState::default();
+        s.cwd = std::path::PathBuf::from("/tmp");
+        s.model = Some(crate::rpc::protocol::Model {
+            id: "deepseek-v4.1-flash".into(),
+            name: Some("DeepSeek V4.1 Flash".into()),
+            provider: "caduceus".into(),
+            context_window: Some(1_000_000),
+            max_tokens: None,
+            reasoning: None,
+        });
+        s.perm_mode = "yolo".into();
+        let rows = s.status_rows(
+            None,
+            Some("free_only=on · per_owner=8 · max=48".into()),
+            None,
+        );
+        let get = |k: &str| {
+            rows.iter()
+                .find(|(label, _)| *label == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert!(get("model").contains("caduceus / deepseek-v4.1-flash"));
+        assert!(get("model").contains("DeepSeek V4.1 Flash"));
+        assert_eq!(get("permissions"), "yolo");
+        assert_eq!(get("profile"), "auto (default)");
+        assert!(get("context").contains("no report yet"));
+        assert!(get("gateway").contains("no state file"));
+        assert!(get("policy").contains("per_owner=8"));
+    }
+
+    #[test]
+    fn status_rows_report_gateway_and_policy_notes() {
+        let s = AppState::default();
+        let gw = crate::tui::caduceus::parse_state(
+            r#"{"ts":0,"gateway_up":true,"cooling":3,
+                "candidates":[{"id":"a/b","owner":"a","context_window":1,"max_tokens":1,"free":true}]}"#,
+        )
+        .unwrap();
+        let rows = s.status_rows(
+            Some((gw, true)),
+            Some("prefs ignored: invalid JSON".into()),
+            Some("fast".into()),
+        );
+        let get = |k: &str| {
+            rows.iter()
+                .find(|(label, _)| *label == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert!(get("gateway").contains("up · 1 free lanes · cooling 3"));
+        assert!(get("gateway").contains("STALE")); // ts 0 → ancient snapshot
+        assert_eq!(get("profile"), "fast");
+        assert!(get("policy").contains("prefs ignored"));
+    }
 
     #[test]
     fn ctx_bar_label_hidden_until_first_report() {
@@ -3226,7 +4982,13 @@ mod tests {
             .join("\n");
         assert!(text.contains('╭'), "block header present: {}", text);
         assert!(text.contains('╰'), "block footer present: {}", text);
-        assert!(text.contains("args"), "args section present: {}", text);
+        // Generic tools render key/value lines (no raw JSON blob, 2026-11-13)
+        assert!(text.contains("path"), "generic args key present: {}", text);
+        assert!(
+            text.contains("src/main.rs"),
+            "generic args value present: {}",
+            text
+        );
         assert!(text.contains("out line"), "output present: {}", text);
     }
 
@@ -3419,6 +5181,7 @@ mod panel_tests {
             Some(7),
             Some(30),
             false,
+            None,
         );
         assert!(
             lines.len() >= 4,
@@ -3449,6 +5212,7 @@ mod panel_tests {
             Some(90),
             Some(1800),
             true,
+            None,
         );
         for l in &lines {
             let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
@@ -3475,6 +5239,7 @@ mod panel_tests {
             Some(93),
             Some(1800),
             true,
+            None,
         );
         let text = lines
             .iter()
@@ -3684,6 +5449,209 @@ mod kani_proofs {
             }
         }
     }
+}
+
+const CLK_TCK: f64 = 100.0; // Linux userspace jiffies-per-second (essentially universal)
+
+/// utime+stime (seconds) of one pid from /proc/<pid>/stat.
+fn stat_cpu_secs(pid: u32) -> Option<f64> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ticks = stat_cpu_ticks(&raw)?;
+    Some(ticks as f64 / CLK_TCK)
+}
+
+fn stat_cpu_ticks(raw: &str) -> Option<u64> {
+    // comm may contain spaces/parens — cut after the closing parenthesis.
+    let after = &raw[raw.rfind(')')? + 1..];
+    let f: Vec<&str> = after.split_whitespace().collect();
+    // fields 14/15 overall → indices 11/12 after comm.
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+fn child_pids(pid: u32) -> Vec<u32> {
+    let raw =
+        std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+    raw.split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect()
+}
+
+/// Total CPU seconds of the whole live subtree rooted at `root` (pi).
+/// Any unreadable node is skipped (a process exiting mid-walk is normal).
+fn subtree_cpu_secs(root: u32) -> Option<f64> {
+    let mut total = stat_cpu_secs(root)?;
+    let mut queue = child_pids(root);
+    while let Some(pid) = queue.pop() {
+        if let Some(c) = stat_cpu_secs(pid) {
+            total += c;
+        }
+        queue.extend(child_pids(pid));
+    }
+    Some(total)
+}
+
+fn watchdog_path() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("watchdog.json");
+    p
+}
+
+/// Facts are only trusted while fresh (2 min) — a stale card would claim
+/// a countdown for a watchdog that no longer watches.
+pub fn load_watchdog_doc() -> Option<WatchdogDoc> {
+    load_watchdog_doc_at(&watchdog_path())
+}
+
+pub fn load_watchdog_doc_at(path: &std::path::Path) -> Option<WatchdogDoc> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let doc: WatchdogDoc = serde_json::from_str(&raw).ok()?;
+    let now = crate::tui::caduceus::now_ms();
+    if doc.version != 1 || now.saturating_sub(doc.ts) > 120_000 {
+        return None;
+    }
+    Some(doc)
+}
+
+fn answer_path() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("inquire-answer.json");
+    p
+}
+
+fn load_answer_doc() -> Option<AnswerDoc> {
+    let raw = std::fs::read_to_string(answer_path()).ok()?;
+    let doc: AnswerDoc = serde_json::from_str(&raw).ok()?;
+    if doc.version != 1 || doc.answer.trim().is_empty() {
+        return None;
+    }
+    Some(doc)
+}
+
+fn answer_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(answer_path())
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+fn hide_thinking_path() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("tui-thinking");
+    p
+}
+
+fn load_hide_thinking() -> bool {
+    if std::env::var("OFFICINA_THINKING_HIDE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::fs::read_to_string(hide_thinking_path())
+        .map(|s| matches!(s.trim(), "hide" | "hidden" | "off" | "1"))
+        .unwrap_or(false)
+}
+
+pub fn persist_hide_thinking(state: &AppState) {
+    let path = hide_thinking_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        path,
+        format!(
+            "{}
+",
+            if state.hide_thinking { "hide" } else { "show" }
+        ),
+    );
+}
+
+fn prompt_history_path() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("input-history.jsonl");
+    p
+}
+
+fn load_prompt_history() -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(prompt_history_path()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<String>(l).ok())
+        .filter(|m| !m.trim().is_empty())
+        .collect();
+    if out.len() > 200 {
+        out.drain(..out.len() - 200);
+    }
+    out
+}
+
+fn append_prompt_history(msg: &str) {
+    use std::io::Write;
+    let path = prompt_history_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(line) = serde_json::to_string(msg) else {
+        return;
+    };
+    if let Ok(mut f) = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+    } {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn prompt_suggestion_path() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("prompt-suggestion.json");
+    p
+}
+
+fn ghost_events_path() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("prompt-suggest-events.jsonl");
+    p
+}
+
+fn profile_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("OFFICINA_ROUTING_PROFILE_FILE") {
+        return std::path::PathBuf::from(p);
+    }
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("routing-profile");
+    p
+}
+
+fn shorten_home_for_status(path: &std::path::Path) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return format!("~{}", rest.display());
+        }
+    }
+    path.display().to_string()
 }
 
 /// Pure oracle for the phase priority (kept out of AppState so the Kani

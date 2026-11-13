@@ -88,6 +88,8 @@ describe("adaptive-router wiring", () => {
     engineUp.current = true;
     process.env.OFFICINA_OVERFLOW = "1";
     process.env.OFFICINA_OVERFLOW_CLOUD = "caduceus/opencode-go/deepseek-v4.1-flash";
+    // Never honour the operator's routing prefs in tests (panel I1).
+    process.env.OFFICINA_CADUCEUS_PREFS_FILE = "/tmp/officina-caduceus-prefs-none.json";
     process.env.OFFICINA_PROVIDER_HEALTH_FILE = "/tmp/officina-adaptive-health-test.json";
     process.env.OFFICINA_ROUTE_LEDGER_DIR = "/tmp/officina-adaptive-ledger-test";
     process.env.OFFICINA_FREE_DAILY_TOKENS = "2000000";
@@ -197,7 +199,7 @@ describe("manual latch", () => {
     expect(setModel).toHaveBeenCalledTimes(1); // unchanged
   });
 
-  it("/overflow on re-arms auto routing after a manual pick", async () => {
+  it("/route-overflow on re-arms auto routing after a manual pick", async () => {
     const h = harness();
     busy.current = false; // pick a manual model while LOCAL and idle
     await h.start();
@@ -206,7 +208,7 @@ describe("manual latch", () => {
     busy.current = true;
     await h.start(); // contention — but manual pauses the spill
     expect(setModel).not.toHaveBeenCalled();
-    await h.command("overflow", "on");
+    await h.command("route-overflow", "on");
     await h.start(); // re-armed: busy local spills to cloud now
     expect(setModel).toHaveBeenCalledTimes(1);
     expect(setModel.mock.calls[0][0]).toMatchObject({ provider: "caduceus" });
