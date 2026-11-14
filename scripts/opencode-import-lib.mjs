@@ -12,11 +12,13 @@ import { DatabaseSync } from "node:sqlite";
 
 export const DEFAULT_OPTIONS = {
   full: false,
-  // No arbitrary message/total caps. These are explicit opt-ins:
-  // --last N and --max-chars N. The only default guards are per-tool-output
-  // and per-reasoning caps, because OpenCode stores multi-GB tool bodies.
+  // A manageable window by default (2026-11-14, operator report: importing
+  // one session pulled in the full ~4M-token history and instantly blew the
+  // context). The newest ~40k tokens are kept verbatim and everything older
+  // collapses into a compact digest entry. --full (or --max-chars 0)
+  // restores the old "everything" behaviour; --last N narrows further.
   last: 0,
-  maxChars: 0,
+  maxChars: 160_000,
   maxToolChars: 500,
   maxToolInputChars: 200,
   maxReasoningChars: 1_000,
@@ -25,6 +27,7 @@ export const DEFAULT_OPTIONS = {
 export const FULL_OPTIONS = {
   ...DEFAULT_OPTIONS,
   full: true,
+  maxChars: 0,
   maxToolChars: 4_000,
   maxToolInputChars: 4_000,
   maxReasoningChars: 4_000,
@@ -246,20 +249,66 @@ export function normalizeOpenCodeSession(source, options = {}) {
       chars -= JSON.stringify(selected[start]).length;
       start += 1;
     }
+    // Never open the window mid-tool-loop: advance to the next user turn.
+    while (start < selected.length - 1 && selected[start].kind !== "user") start += 1;
+    chars = selected
+      .slice(start)
+      .reduce((sum, block) => sum + JSON.stringify(block).length, 0);
   }
 
+  const firstKept = blocks.length - selected.length + start;
+  const omitted = blocks.slice(0, firstKept);
+  const kept = selected.slice(start);
+
   return {
-    blocks: selected.slice(start),
+    blocks: kept,
+    digest: buildImportDigest(omitted, opts),
     stats: {
       sourceMessages: (source.messages ?? []).length,
       sourceParts: (source.parts ?? []).length,
       blocks: blocks.length,
-      selected: selected.length - start,
+      selected: kept.length,
+      omittedBlocks: omitted.length,
+      omittedChars: omitted.reduce((sum, block) => sum + JSON.stringify(block).length, 0),
       skipped,
       chars,
       full: opts.full === true,
     },
   };
+}
+
+/**
+ * One hidden context entry describing what was dropped by the default cap.
+ * Bounded: a header plus the most recent 25 user prompts (oldest first,
+ * clipped) so the model knows the arc without carrying the payload.
+ */
+export function buildImportDigest(omitted, opts = DEFAULT_OPTIONS) {
+  if (!Array.isArray(omitted) || omitted.length === 0) return "";
+  const chars = omitted.reduce((sum, block) => sum + JSON.stringify(block).length, 0);
+  const allUsers = omitted.filter((b) => b.kind === "user");
+  const head = allUsers.slice(0, 3);
+  const tail = allUsers.length > 25 ? allUsers.slice(-22) : [];
+  const lines = [
+    `Imported from an OpenCode session: ${omitted.length} earlier message block(s) (~${chars} chars) were omitted to keep the context manageable; the transcript below is the most recent portion.`,
+  ];
+  if (allUsers.length > 0) {
+    lines.push("Earlier user prompts (start of the arc + most recent, truncated):");
+    const emit = (u) => {
+      const one = String(u.text ?? "").replace(/\s+/g, " ").trim();
+      if (one) lines.push(`- ${one.length > 120 ? `${one.slice(0, 119)}…` : one}`);
+    };
+    head.forEach(emit);
+    if (tail.length > 0) {
+      lines.push("  …");
+      tail.forEach(emit);
+    } else {
+      allUsers.slice(head.length).forEach(emit);
+    }
+  }
+  lines.push(
+    "If the omitted history matters, ask the operator to re-import with `/import-opencode <id> full` (CLI: `--full`), or narrow with `--last N`.",
+  );
+  return lines.join("\n");
 }
 
 export function sessionDirForCwd(cwd, sessionsRoot = join(homedir(), ".pi", "agent", "sessions")) {
@@ -284,6 +333,22 @@ export function toSessionJsonl(source, normalized, options = {}) {
     cwd,
   }];
   let parentId = null;
+
+  // Hidden digest of the omitted history (default-cap imports). A custom
+  // message rides in context without cluttering the visible transcript.
+  if (normalized.digest) {
+    const id = shortId();
+    entries.push({
+      type: "custom_message",
+      customType: "opencode-import",
+      content: normalized.digest,
+      display: false,
+      id,
+      parentId: null,
+      timestamp: now,
+    });
+    parentId = id;
+  }
 
   for (const block of normalized.blocks) {
     const timestamp = new Date(block.timestamp || Date.now()).toISOString();
@@ -345,6 +410,168 @@ export function toSessionJsonl(source, normalized, options = {}) {
   }
 
   return `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+}
+
+/**
+ * Compact an ALREADY-imported pi session (2026-11-14, operator report: one
+ * import predates the default budget and carries ~2.6M tokens).
+ *
+ * Works on the JSONL text: groups entries into conversation units (a user
+ * message plus everything before the next user message, so assistant calls
+ * stay with their tool results), keeps the newest units within `maxChars`,
+ * and replaces the dropped prefix with one hidden digest entry. Parent links
+ * are rebuilt; ids are preserved.
+ */
+export function compactSessionText(text, options = {}) {
+  const maxChars = Number.isFinite(options.maxChars) ? options.maxChars : DEFAULT_OPTIONS.maxChars;
+  const rows = String(text ?? "")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
+  const header = rows.find((row) => row.type === "session");
+  if (!header || header.version !== 3) throw new Error("not a pi session v3 file");
+  const body = rows.filter((row) => row !== header);
+
+  const sizeOf = (row) => JSON.stringify(row).length;
+  const isUser = (row) => row.type === "message" && row.message?.role === "user";
+  // Units start at each user message; entries before the first user turn
+  // (thinking_level_change, custom context) attach to the first unit.
+  const units = [];
+  let current = null;
+  for (const row of body) {
+    if (isUser(row) || current === null) {
+      if (!current) {
+        current = [];
+        units.push(current);
+      } else if (isUser(row)) {
+        current = [row];
+        units.push(current);
+        continue;
+      }
+    }
+    current.push(row);
+  }
+  if (units.length === 0) return { text, stats: { keptUnits: 0, omittedUnits: 0, chars: sizeOf(header) } };
+
+  let keptFrom = units.length - 1;
+  let chars = 0;
+  for (let i = units.length - 1; i >= 0; i -= 1) {
+    const unitChars = units[i].reduce((sum, row) => sum + sizeOf(row), 0);
+    if (chars + unitChars > maxChars && i < units.length - 1) break;
+    chars += unitChars;
+    keptFrom = i;
+  }
+
+  const omitted = units.slice(0, keptFrom).flat();
+  const kept = units.slice(keptFrom).flat();
+  const digest = buildImportDigest(
+    omitted
+      .filter((row) => row.type === "message")
+      .map((row) => ({
+        kind: row.message?.role === "user" ? "user" : "assistant",
+        text:
+          row.message?.role === "user"
+            ? (row.message.content ?? []).map((c) => c.text ?? "").join(" ")
+            : "",
+      }))
+      .filter((block) => block.text),
+    DEFAULT_OPTIONS,
+  );
+
+  const entries = [header];
+  let parentId = null;
+  if (digest) {
+    const id = shortId();
+    entries.push({
+      type: "custom_message",
+      customType: "opencode-import",
+      content: digest,
+      display: false,
+      id,
+      parentId: null,
+      timestamp: new Date().toISOString(),
+    });
+    parentId = id;
+  }
+  for (const row of kept) {
+    entries.push({ ...row, parentId });
+    parentId = row.id;
+  }
+  const out = `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+  return {
+    text: out,
+    stats: {
+      keptUnits: units.length - keptFrom,
+      omittedUnits: keptFrom,
+      omittedEntries: omitted.length,
+      keptEntries: kept.length,
+      chars: Buffer.byteLength(out),
+      maxChars,
+    },
+  };
+}
+
+/** Structural conformance check for a pi session JSONL (v3). */
+export function validateSessionText(text) {
+  const rows = String(text ?? "")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line, index) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return { __badLine: index + 1 };
+      }
+    });
+  const issues = [];
+  const header = rows.find((row) => row.type === "session");
+  if (!header) issues.push("missing session header");
+  else if (header.version !== 3) issues.push(`session version ${header.version} != 3`);
+  const body = rows.filter((row) => row !== header);
+  const seen = new Set();
+  let prev = null;
+  const calls = new Set();
+  const results = new Set();
+  for (const [index, row] of body.entries()) {
+    if (row.__badLine) {
+      issues.push(`line ${row.__badLine}: invalid JSON`);
+      continue;
+    }
+    if (!row.id) {
+      issues.push(`entry ${index}: missing id`);
+      continue;
+    }
+    if (seen.has(row.id)) issues.push(`duplicate id ${row.id}`);
+    seen.add(row.id);
+    if (row.parentId !== prev) issues.push(`chain break at ${row.id}`);
+    prev = row.id;
+    const role = row.message?.role;
+    if (row.type === "message" && !["user", "assistant", "toolResult", "system"].includes(role)) {
+      issues.push(`entry ${row.id}: bad role ${role}`);
+    }
+    if (role === "assistant") {
+      for (const part of row.message.content ?? []) {
+        if (part.type === "toolCall") calls.add(part.id);
+      }
+    }
+    if (role === "toolResult") results.add(row.message.toolCallId);
+  }
+  for (const call of calls) {
+    if (!results.has(call)) issues.push(`toolCall ${call} has no toolResult`);
+  }
+  for (const result of results) {
+    if (!calls.has(result)) issues.push(`toolResult ${result} has no toolCall`);
+  }
+  return {
+    ok: issues.length === 0,
+    issues,
+    stats: {
+      entries: body.length,
+      chars: Buffer.byteLength(String(text ?? "")),
+      toolCalls: calls.size,
+      toolResults: results.size,
+    },
+  };
 }
 
 export function writeSession(cwd, source, normalized, options = {}) {

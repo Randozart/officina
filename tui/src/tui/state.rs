@@ -152,6 +152,7 @@ pub fn tool_display_name(name: &str) -> String {
         "find" => "Find",
         "grep" => "Grep",
         "ls" => "List Directory",
+        "code" => "Code",
         _ => {
             let mut out = String::with_capacity(name.len());
             let mut cap = true;
@@ -334,6 +335,12 @@ pub enum ChatEntry {
         /// closed (line) → formatted (block) → full → closed. None follows
         /// the /tools config until the first click.
         click_mode: Option<ToolVerbosity>,
+        /// Canonical unified diff from pi's edit tool (result.details.diff).
+        diff: Option<String>,
+        /// `write` overwrite: file content captured before the tool ran.
+        pre_content: Option<String>,
+        /// Post-call check outcomes (format / syntax / praetor facts file).
+        checks: Option<ToolChecks>,
         output: Vec<String>,
         output_truncated: bool,
         running: bool,
@@ -417,6 +424,78 @@ pub struct WatchdogDoc {
     pub reason: String,
     pub next_check_at: u64,
     pub phase: String,
+}
+
+/// Per-call check outcomes written by extensions (facts file, 2026-11-14):
+/// format-gate / diagnostics-loop / praetor. Status only — no source text.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct ToolChecks {
+    pub format: Option<FormatCheck>,
+    pub syntax: Option<SyntaxCheck>,
+    pub praetor: Option<PraetorCheck>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct FormatCheck {
+    pub tool: String,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SyntaxCheck {
+    pub ok: bool,
+    pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct PraetorCheck {
+    pub count: u64,
+}
+
+fn tool_checks_path(tool_call_id: &str) -> std::path::PathBuf {
+    let safe: String = tool_call_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect();
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("toolchecks");
+    p.push(format!("{safe}.json"));
+    p
+}
+
+fn load_tool_checks_in(dir: Option<&std::path::Path>, tool_call_id: &str) -> Option<ToolChecks> {
+    let path = match dir {
+        Some(d) => {
+            let safe: String = tool_call_id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(120)
+                .collect();
+            d.join(format!("{safe}.json"))
+        }
+        None => tool_checks_path(tool_call_id),
+    };
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 /// A staged next-prompt suggestion (voice-suggestions stage 1).
@@ -694,6 +773,14 @@ pub struct AppState {
     /// Injectable default-prefs path (tests must never write the
     /// operator's live file).
     pub thinking_default_file: Option<std::path::PathBuf>,
+    /// Injectable toolchecks dir (tests never read the operator's live facts).
+    pub tool_checks_dir: Option<std::path::PathBuf>,
+    /// Per-entry rendered lines (idx → (revision, lines)). `chat_lines` used
+    /// to rebuild the whole transcript every frame — 59 ms at 2.8k entries,
+    /// which starved input on long sessions (2026-11-14 perf fix). Static
+    /// entries are now rendered once and cloned; only the streaming tail
+    /// (and running tools) re-render per frame.
+    pub entry_lines_cache: std::collections::HashMap<usize, (u64, Vec<Line<'static>>)>,
     /// Line → entry map of the last chat_lines output. The renderer also
     /// derives clickable thinking-block row ranges from it (2026-11-13).
     pub line_entries: Vec<usize>,
@@ -948,6 +1035,7 @@ impl Default for AppState {
             hide_thinking: load_hide_thinking(),
             thinking_default_collapsed: load_thinking_default(),
             thinking_default_file: None,
+            tool_checks_dir: None,
             watchdog: None,
             watchdog_file: None,
             fx_open: false,
@@ -1024,6 +1112,7 @@ impl Default for AppState {
             scroll: 0,
             scroll_max: 0,
             md_cache: HashMap::new(),
+            entry_lines_cache: std::collections::HashMap::new(),
             line_entries: Vec::new(),
             thinking_hitboxes: Vec::new(),
             tool_hitboxes: Vec::new(),
@@ -2395,6 +2484,25 @@ impl AppState {
     /// Tool execution started — add a running tool entry with full args.
     pub fn tool_start(&mut self, tool_call_id: Option<&str>, name: &str, args: &serde_json::Value) {
         let summary = summarize_args(name, args);
+        // write overwrites: snapshot the old content so the block can show a
+        // real diff (2026-11-14). Capped; read failures are silent.
+        let pre_content = if name.eq_ignore_ascii_case("write") {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("file"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let abs = if std::path::Path::new(path).is_absolute() {
+                std::path::PathBuf::from(path)
+            } else {
+                self.cwd.join(path)
+            };
+            std::fs::read_to_string(abs)
+                .ok()
+                .filter(|t| t.len() <= 200 * 1024)
+        } else {
+            None
+        };
         let timeout_s = args.get("timeout").and_then(|v| v.as_u64()).or_else(|| {
             args.get("timeout")
                 .and_then(|v| v.as_i64())
@@ -2406,6 +2514,9 @@ impl AppState {
             summary,
             args: Some(args.clone()),
             click_mode: None,
+            diff: None,
+            pre_content,
+            checks: None,
             output: Vec::new(),
             output_truncated: false,
             running: true,
@@ -2454,6 +2565,34 @@ impl AppState {
     }
 
     /// Tool execution finished — match by toolCallId first, name fallback.
+    /// Attach pi's canonical edit diff (result.details.diff) to the entry.
+    pub fn set_tool_diff(&mut self, tool_call_id: Option<&str>, diff: Option<String>) {
+        let Some(diff) = diff else { return };
+        if diff.trim().is_empty() {
+            return;
+        }
+        for e in self.entries.iter_mut().rev() {
+            if let ChatEntry::Tool {
+                tool_call_id: ref id,
+                running,
+                diff: slot,
+                render_cache,
+                ..
+            } = e
+            {
+                let matched = match (tool_call_id, id.as_deref()) {
+                    (Some(cid), Some(eid)) => cid == eid,
+                    _ => false,
+                };
+                if matched && *running {
+                    *slot = Some(diff);
+                    *render_cache = None;
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn tool_end(
         &mut self,
         tool_call_id: Option<&str>,
@@ -2461,6 +2600,8 @@ impl AppState {
         result_text: &str,
         error: bool,
     ) {
+        let checks =
+            tool_call_id.and_then(|id| load_tool_checks_in(self.tool_checks_dir.as_deref(), id));
         // Append result text to output.
         if !result_text.is_empty() {
             self.tool_update(tool_call_id, name, result_text);
@@ -2485,6 +2626,17 @@ impl AppState {
                 if matched && *running {
                     *running = false;
                     *e_err = error;
+                    if let ChatEntry::Tool {
+                        checks: slot,
+                        render_cache,
+                        ..
+                    } = e
+                    {
+                        if checks.is_some() {
+                            *slot = checks;
+                            *render_cache = None;
+                        }
+                    }
                     return;
                 }
             }
@@ -3027,15 +3179,73 @@ impl AppState {
     /// Drop the markdown render cache (on transcript clear/rehydrate).
     pub fn md_cache_clear(&mut self) {
         self.md_cache.clear();
+        self.entry_lines_cache.clear();
     }
 
     /// All chat lines as styled ratatui Lines.
     /// Assistant entries go through the markdown renderer (cached).
     /// Tool entries render per their effective verbosity mode (cached per
     /// entry against width + tools_gen + output length).
+    /// Cheap revision of an entry's rendered inputs (2026-11-14): content
+    /// lengths + flags that change the output. Args are immutable after a
+    /// tool starts, so only output/diff/checks growth matters.
+    fn entry_rev(entry: &ChatEntry, width: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        width.hash(&mut h);
+        std::mem::discriminant(entry).hash(&mut h);
+        match entry {
+            ChatEntry::User(t)
+            | ChatEntry::Assistant(t)
+            | ChatEntry::Diag(t)
+            | ChatEntry::Warn(t)
+            | ChatEntry::Error(t)
+            | ChatEntry::Notice(t)
+            | ChatEntry::Watchdog(t) => t.len().hash(&mut h),
+            ChatEntry::Thinking { text, collapsed } => {
+                text.len().hash(&mut h);
+                collapsed.hash(&mut h);
+            }
+            ChatEntry::Tool {
+                name,
+                summary,
+                output,
+                output_truncated,
+                error,
+                click_mode,
+                diff,
+                pre_content,
+                checks,
+                ..
+            } => {
+                name.hash(&mut h);
+                summary.hash(&mut h);
+                output.len().hash(&mut h);
+                output_truncated.hash(&mut h);
+                error.hash(&mut h);
+                click_mode.map(ToolVerbosity::label).hash(&mut h);
+                diff.as_ref().map(|d| d.len()).hash(&mut h);
+                pre_content.as_ref().map(|c| c.len()).hash(&mut h);
+                if let Some(c) = checks {
+                    c.format
+                        .as_ref()
+                        .map(|f| (f.tool.as_str(), f.changed))
+                        .hash(&mut h);
+                    c.syntax.as_ref().map(|s| s.ok).hash(&mut h);
+                    c.praetor.as_ref().map(|p| p.count).hash(&mut h);
+                }
+            }
+            _ => {}
+        }
+        h.finish()
+    }
+
     pub fn chat_lines(&mut self, width: usize) -> Vec<Line<'static>> {
         if self.md_cache.len() > 1024 {
             self.md_cache.clear();
+        }
+        if self.entry_lines_cache.len() > self.entries.len() {
+            self.entry_lines_cache.clear();
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut line_entries: Vec<usize> = Vec::new();
@@ -3050,6 +3260,34 @@ impl AppState {
         let wd = self.watchdog.clone();
         for (idx, entry) in self.entries.iter_mut().enumerate() {
             let before = lines.len();
+            // Dynamic entries (the streaming tail's thinking block, running
+            // tools) animate — never cached (2026-11-14).
+            let dynamic = matches!(entry, ChatEntry::Tool { running: true, .. })
+                || matches!(entry, ChatEntry::Thinking { .. })
+                    && idx + 1 == total
+                    && self.is_streaming;
+            if !dynamic {
+                let rev = Self::entry_rev(entry, width);
+                if let Some((cached_rev, cached)) = self.entry_lines_cache.get(&idx) {
+                    if *cached_rev == rev {
+                        lines.extend(cached.iter().cloned());
+                        for _ in before..lines.len() {
+                            line_entries.push(idx);
+                        }
+                        if lines.len() > before && idx + 1 < total {
+                            let already_blank = lines
+                                .last()
+                                .map(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+                                .unwrap_or(true);
+                            if !already_blank {
+                                lines.push(Line::from(""));
+                                line_entries.push(idx);
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             match entry {
                 ChatEntry::User(text) => {
                     for (i, seg) in wrap_text(text, width.saturating_sub(2))
@@ -3185,6 +3423,9 @@ impl AppState {
                     timeout_s,
                     render_cache,
                     click_mode,
+                    diff,
+                    pre_content,
+                    checks,
                     ..
                 } => {
                     // Click override wins over /tools config (2026-11-14).
@@ -3291,6 +3532,9 @@ impl AppState {
                                 *timeout_s,
                                 no_output_hint,
                                 liveness.clone(),
+                                diff.as_deref(),
+                                pre_content.as_deref(),
+                                checks.as_ref(),
                             );
                             *render_cache = Some((body_w, gen, olen, tick, block));
                         }
@@ -3485,6 +3729,11 @@ impl AppState {
                     ]));
                 }
             }
+            if !dynamic {
+                let rev = Self::entry_rev(entry, width);
+                self.entry_lines_cache
+                    .insert(idx, (rev, lines[before..].to_vec()));
+            }
             // Breathing room between transcript entries (owner request
             // 2026-11-10: everything was bunched). Exactly one blank row,
             // never doubled when a renderer already ends blank.
@@ -3532,7 +3781,7 @@ impl AppState {
         ("sidebar", "cycle sidebar visibility", "/sidebar — auto (hide when narrow) → show → hide"),
         ("permissions", "permission mode", "/permissions — ask | auto | yolo (sensitive roots always guarded)"),
         ("yolo", "toggle YOLO mode", "/yolo — toggle ask <-> yolo (sensitive roots still prompt)"),
-        ("import-opencode", "import an OpenCode session", "/import-opencode [latest|<id>|list] [full] — convert an OpenCode session for this project and switch to it"),
+        ("import-opencode", "import an OpenCode session", "/import-opencode [latest|<id>|list] [full] — convert an OpenCode session and switch to it (default: newest ~40k tokens + a digest of older history; full = everything)"),
         ("model", "select a model", "/model [provider/id] — picker from available models; provider/id switches directly"),
         ("new", "new session", "/new — fresh session (old one stays resumable)"),
         ("quit", "quit the TUI", "/quit — deliberate quit; the only other path is ^esc"),
@@ -4174,6 +4423,233 @@ fn generic_args_lines(
     lines
 }
 
+/// Status glyphs in check reports (`code` tool, verify tails): colored so a
+/// failing gate reads instantly in the transcript (2026-11-14).
+fn status_line_style(line: &str, default: Style) -> Style {
+    let t = line.trim_start();
+    let fg = if t.starts_with('✓') {
+        theme::GREEN
+    } else if t.starts_with('✗') || t.starts_with('×') {
+        theme::RED
+    } else if t.starts_with('⚠') {
+        theme::ORANGE
+    } else {
+        return default;
+    };
+    Style::default().fg(fg).bg(default.bg.unwrap_or(theme::BG))
+}
+
+/// Diff line style on an explicit surface (tool blocks use PANEL).
+fn diff_line_on(line: &str, surf: ratatui::style::Color) -> Style {
+    let t = line.trim_start();
+    if t.starts_with("@@") {
+        Style::default().fg(theme::GOLD).bg(surf)
+    } else if t.starts_with("+++") || t.starts_with("---") {
+        Style::default().fg(theme::MUTED).bg(surf)
+    } else if t.starts_with('+') {
+        Style::default().fg(theme::GREEN).bg(surf)
+    } else if t.starts_with('-') {
+        Style::default().fg(theme::RED).bg(surf)
+    } else {
+        Style::default().fg(theme::TEXT).bg(surf)
+    }
+}
+
+/// Diff text for an edit call derived from its args (used while running,
+/// before pi returns result.details.diff).
+fn edit_diff_from_args(path: &str, args: &serde_json::Value) -> Option<String> {
+    let mut edits: Vec<(String, String)> = Vec::new();
+    if let Some(list) = args.get("edits").and_then(|v| v.as_array()) {
+        for e in list {
+            if let (Some(o), Some(n)) = (
+                e.get("oldText").and_then(|v| v.as_str()),
+                e.get("newText").and_then(|v| v.as_str()),
+            ) {
+                edits.push((o.to_string(), n.to_string()));
+            }
+        }
+    }
+    if edits.is_empty() {
+        if let (Some(o), Some(n)) = (
+            args.get("oldText").and_then(|v| v.as_str()),
+            args.get("newText").and_then(|v| v.as_str()),
+        ) {
+            edits.push((o.to_string(), n.to_string()));
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let mut joined = String::new();
+    for (o, n) in edits {
+        let d = crate::tui::diff::unified(&o, &n, path, 2, 140);
+        if !d.is_empty() {
+            joined.push_str(&d.join("\n"));
+            joined.push('\n');
+        }
+    }
+    (!joined.is_empty()).then_some(joined)
+}
+
+fn push_diff_block(
+    out: &mut Vec<Line<'static>>,
+    text: &str,
+    label: &str,
+    cap: usize,
+    width: usize,
+    surf: ratatui::style::Color,
+    border: Style,
+    muted: Style,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    out.push(Line::from(vec![
+        Span::styled("│ ", border),
+        Span::styled(label.to_string(), muted),
+    ]));
+    let total = text.lines().count();
+    for line in text.lines().take(cap) {
+        out.push(Line::from(vec![
+            Span::styled("│ ", border),
+            Span::styled(
+                trunc_str(line, width.saturating_sub(3)),
+                diff_line_on(line, surf),
+            ),
+        ]));
+    }
+    if total > cap {
+        out.push(Line::from(vec![
+            Span::styled("│ ", border),
+            Span::styled(format!("… {} more diff line(s)", total - cap), muted),
+        ]));
+    }
+}
+
+/// Code + diff view for edit/write tool blocks (2026-11-14, operator
+/// request: "show the code and diffs"). Empty when the args carry nothing.
+fn code_view_lines(
+    name: &str,
+    args: &serde_json::Value,
+    diff: Option<&str>,
+    pre_content: Option<&str>,
+    full: bool,
+    width: usize,
+    surf: ratatui::style::Color,
+) -> Vec<Line<'static>> {
+    let border = Style::default().fg(theme::BORDER_DIM).bg(surf);
+    let muted = Style::default().fg(theme::MUTED).bg(surf);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let path = args
+        .get("path")
+        .or_else(|| args.get("file"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if name.eq_ignore_ascii_case("edit") {
+        let computed = diff
+            .map(str::to_string)
+            .or_else(|| edit_diff_from_args(path, args));
+        if let Some(text) = computed {
+            push_diff_block(
+                &mut out,
+                &text,
+                "diff",
+                if full { 200 } else { 24 },
+                width,
+                surf,
+                border,
+                muted,
+            );
+        }
+        return out;
+    }
+
+    // write: content preview (highlighted) + overwrite diff.
+    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let overwrite_diff = pre_content
+        .filter(|old| *old != content)
+        .map(|old| crate::tui::diff::unified(old, content, path, 2, 200).join("\n"))
+        .filter(|d| !d.is_empty());
+
+    if !full {
+        if let Some(text) = overwrite_diff.as_deref() {
+            push_diff_block(
+                &mut out,
+                text,
+                "diff (overwrite)",
+                24,
+                width,
+                surf,
+                border,
+                muted,
+            );
+            return out;
+        }
+    }
+
+    if !content.is_empty() {
+        // Markdown files render as markdown (2026-11-14, operator report:
+        // a .md write showed the diff but the preview stayed raw text).
+        let lower = path.to_ascii_lowercase();
+        let is_markdown =
+            lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdx");
+        out.push(Line::from(vec![
+            Span::styled("│ ", border),
+            Span::styled(
+                if full {
+                    if is_markdown {
+                        "markdown".to_string()
+                    } else {
+                        "code".to_string()
+                    }
+                } else {
+                    format!(
+                        "{} · {} line(s)",
+                        if is_markdown { "markdown" } else { "code" },
+                        content.lines().count()
+                    )
+                },
+                muted,
+            ),
+        ]));
+        let cap = if full { 400 } else { 24 };
+        let total = content.lines().count();
+        let rendered = if is_markdown {
+            crate::markdown::render(content, width.saturating_sub(4))
+        } else {
+            crate::markdown::highlight_code(path, content, width.saturating_sub(4))
+        };
+        for line in rendered.into_iter().take(cap) {
+            let mut spans = vec![Span::styled("│   ", border)];
+            spans.extend(line.spans);
+            out.push(Line::from(spans));
+        }
+        if total > cap {
+            out.push(Line::from(vec![
+                Span::styled("│ ", border),
+                Span::styled(format!("… {} more line(s)", total - cap), muted),
+            ]));
+        }
+    }
+
+    if full {
+        if let Some(text) = overwrite_diff.as_deref() {
+            push_diff_block(
+                &mut out,
+                text,
+                "diff (overwrite)",
+                80,
+                width,
+                surf,
+                border,
+                muted,
+            );
+        }
+    }
+    out
+}
+
 fn render_tool_block(
     mode: ToolVerbosity,
     name: &str,
@@ -4188,6 +4664,9 @@ fn render_tool_block(
     timeout_s: Option<u64>,
     no_output_hint: bool,
     liveness: Option<(String, bool)>,
+    diff: Option<&str>,
+    pre_content: Option<&str>,
+    checks: Option<&ToolChecks>,
 ) -> Vec<Line<'static>> {
     let full = mode == ToolVerbosity::Full;
     // The panel is an OPAQUE PLATE (owner request 2026-09-03: fire must
@@ -4247,7 +4726,15 @@ fn render_tool_block(
     // Args section — purpose-built for the extension/shell tools, generic
     // JSON only for everything else.
     if let Some(a) = args.filter(|a| !a.is_null()) {
-        if let Some(special) = special_tool_args(name, a, full, width, surf) {
+        // Code-writing tools show the code and the diff (2026-11-14).
+        let code_view = if name.eq_ignore_ascii_case("edit") || name.eq_ignore_ascii_case("write") {
+            code_view_lines(name, a, diff, pre_content, full, width, surf)
+        } else {
+            Vec::new()
+        };
+        if !code_view.is_empty() {
+            lines.extend(code_view);
+        } else if let Some(special) = special_tool_args(name, a, full, width, surf) {
             lines.extend(special);
         } else {
             // Generic tools: key/value lines instead of a raw JSON blob
@@ -4291,7 +4778,7 @@ fn render_tool_block(
             let line_st = if is_diff {
                 diff_line_style(ol, text_st)
             } else {
-                text_st
+                status_line_style(ol, text_st)
             };
             for (i, seg) in wrap_text(ol, width.saturating_sub(5))
                 .into_iter()
@@ -4352,6 +4839,58 @@ fn render_tool_block(
                     muted_st.add_modifier(ratatui::style::Modifier::ITALIC),
                 ),
             ]));
+        }
+    }
+
+    // Post-call checks (format/syntax/praetor facts, 2026-11-14).
+    if let Some(c) = checks {
+        let mut spans: Vec<Span> = vec![Span::styled("│ ", border)];
+        let mut any = false;
+        if let Some(f) = &c.format {
+            if any {
+                spans.push(Span::styled(" · ", muted_st));
+            }
+            let ok = Style::default().fg(theme::GREEN).bg(surf);
+            spans.push(Span::styled(
+                format!("{} {}", if f.changed { "✓" } else { "·" }, f.tool),
+                if f.changed { ok } else { muted_st },
+            ));
+            any = true;
+        }
+        if let Some(sy) = &c.syntax {
+            if any {
+                spans.push(Span::styled(" · ", muted_st));
+            }
+            spans.push(Span::styled(
+                if sy.ok { "✓ syntax" } else { "✗ syntax" }.to_string(),
+                if sy.ok {
+                    Style::default().fg(theme::GREEN).bg(surf)
+                } else {
+                    Style::default().fg(theme::RED).bg(surf)
+                },
+            ));
+            any = true;
+        }
+        if let Some(pr) = &c.praetor {
+            if any {
+                spans.push(Span::styled(" · ", muted_st));
+            }
+            spans.push(Span::styled(
+                if pr.count == 0 {
+                    "✓ praetor".to_string()
+                } else {
+                    format!("⚠ praetor {}", pr.count)
+                },
+                if pr.count == 0 {
+                    Style::default().fg(theme::GREEN).bg(surf)
+                } else {
+                    Style::default().fg(theme::ORANGE).bg(surf)
+                },
+            ));
+            any = true;
+        }
+        if any {
+            lines.push(Line::from(spans));
         }
     }
 
@@ -4922,6 +5461,216 @@ mod tests {
             2
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn flat_text(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn write_block_shows_highlighted_code() {
+        let mut s = AppState::default();
+        s.tool_start(
+            Some("w1"),
+            "write",
+            &serde_json::json!({"path": "src/a.rs", "content": "fn main() {\n    println!(\"hi\");\n}\n"}),
+        );
+        s.tool_end(Some("w1"), "write", "ok", false);
+        s.tool_default = ToolVerbosity::Block;
+        let text = flat_text(&s.chat_lines(100));
+        assert!(text.contains("Write"), "formal title: {text}");
+        assert!(
+            text.contains("code · 4 line(s)") || text.contains("code · 3 line(s)"),
+            "{text}"
+        );
+        assert!(text.contains("fn main"), "content shown: {text}");
+    }
+
+    #[test]
+    fn write_overwrite_shows_a_diff() {
+        let dir = std::env::temp_dir().join(format!("write-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "old line\nkeep\n").unwrap();
+        let mut s = AppState::default();
+        s.cwd = dir.clone();
+        s.tool_default = ToolVerbosity::Block;
+        s.tool_start(
+            Some("w2"),
+            "write",
+            &serde_json::json!({"path": "a.txt", "content": "new line\nkeep\n"}),
+        );
+        s.tool_end(Some("w2"), "write", "ok", false);
+        let text = flat_text(&s.chat_lines(100));
+        assert!(text.contains("diff (overwrite)"), "{text}");
+        assert!(text.contains("-old line"), "{text}");
+        assert!(text.contains("+new line"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_block_shows_diff_from_args_and_canonical_details() {
+        let mut s = AppState::default();
+        s.tool_default = ToolVerbosity::Block;
+        s.tool_start(
+            Some("e1"),
+            "edit",
+            &serde_json::json!({"path": "a.rs", "oldText": "fn a() {}\n", "newText": "fn b() {}\n"}),
+        );
+        let text = flat_text(&s.chat_lines(100));
+        assert!(text.contains("diff"), "{text}");
+        assert!(text.contains("-fn a"), "{text}");
+        assert!(text.contains("+fn b"), "{text}");
+        // Canonical diff from pi replaces the derived one.
+        s.set_tool_diff(
+            Some("e1"),
+            Some("--- a.rs\n+++ a.rs\n-canonical-old\n+canonical-new".to_string()),
+        );
+        s.tool_end(Some("e1"), "edit", "ok", false);
+        let text = flat_text(&s.chat_lines(100));
+        assert!(text.contains("-canonical-old"), "{text}");
+        assert!(text.contains("+canonical-new"), "{text}");
+    }
+
+    #[test]
+    fn tool_block_shows_check_footer_from_facts() {
+        let dir = std::env::temp_dir().join(format!("toolchecks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("c1.json"),
+            r#"{"version":1,"ts":1,"format":{"tool":"rustfmt","changed":true},"syntax":{"ok":true},"praetor":{"count":2}}"#,
+        )
+        .unwrap();
+        let mut s = AppState::default();
+        s.tool_default = ToolVerbosity::Block;
+        s.tool_checks_dir = Some(dir.clone());
+        s.tool_start(
+            Some("c1"),
+            "write",
+            &serde_json::json!({"path": "a.rs", "content": "fn x() {}"}),
+        );
+        s.tool_end(Some("c1"), "write", "ok", false);
+        let text = flat_text(&s.chat_lines(100));
+        assert!(text.contains("✓ rustfmt"), "{text}");
+        assert!(text.contains("✓ syntax"), "{text}");
+        assert!(text.contains("⚠ praetor 2"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn code_tool_output_colors_status_lines() {
+        let mut s = AppState::default();
+        s.tool_default = ToolVerbosity::Block;
+        s.tool_start(Some("c2"), "code", &serde_json::json!({}));
+        s.tool_end(
+            Some("c2"),
+            "code",
+            "code: 1 file\n  ✓ syntax a.rs\n  ✗ gates\n",
+            false,
+        );
+        let lines = s.chat_lines(120);
+        let ok = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|sp| sp.style.fg == Some(theme::GREEN) && sp.content.contains("syntax"));
+        let bad = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|sp| sp.style.fg == Some(theme::RED) && sp.content.contains("gates"));
+        assert!(ok, "green status line: {}", flat_text(&lines));
+        assert!(bad, "red status line: {}", flat_text(&lines));
+    }
+
+    #[test]
+    fn transcript_cache_is_transparent_and_invalidates() {
+        let mut s = AppState::default();
+        s.hide_thinking = false;
+        s.thinking_default_collapsed = false;
+        s.push_user("hello".into());
+        s.push_text_delta("answer text\n");
+        s.push_thinking_delta("reasoning");
+        s.tool_start(Some("t"), "bash", &serde_json::json!({"command": "ls"}));
+        s.tool_end(Some("t"), "bash", "a\nb", false);
+
+        let flat = |v: Vec<Line<'static>>| {
+            v.iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let a = flat(s.chat_lines(80));
+        let b = flat(s.chat_lines(80)); // warm cache
+        assert_eq!(a, b, "warm frames are identical");
+        assert_eq!(s.line_entries.len(), s.chat_lines(80).len());
+        s.entry_lines_cache.clear();
+        let c = flat(s.chat_lines(80)); // cold rebuild
+        assert_eq!(a, c, "the cache must be transparent");
+
+        s.push_text_delta(" more words");
+        let d = flat(s.chat_lines(80));
+        assert!(d.contains("more words"), "tail mutation invalidates: {d}");
+        assert_ne!(a, d);
+
+        s.entries.push(ChatEntry::Thinking {
+            text: "trace-body".into(),
+            collapsed: false,
+        });
+        let e1 = flat(s.chat_lines(80));
+        if let Some(ChatEntry::Thinking { collapsed, .. }) = s.entries.last_mut() {
+            *collapsed = true;
+        }
+        let e2 = flat(s.chat_lines(80));
+        assert!(e1.contains("trace-body"), "{e1}");
+        assert!(e2.contains("click to expand"), "collapse invalidates: {e2}");
+    }
+
+    #[test]
+    fn streaming_tail_rerenders_per_frame() {
+        let mut s = AppState::default();
+        s.hide_thinking = false;
+        s.thinking_default_collapsed = false;
+        s.push_user("go".into());
+        s.is_streaming = true;
+        s.push_text_delta("first");
+        let a = s
+            .chat_lines(80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.push_text_delta(" second");
+        let b = s
+            .chat_lines(80)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(a.contains("first") && !a.contains("second"), "{a}");
+        assert!(b.contains("first second"), "{b}");
+    }
+
+    #[test]
+    fn write_block_renders_markdown_files_as_markdown() {
+        let mut s = AppState::default();
+        s.tool_default = ToolVerbosity::Block;
+        s.tool_start(
+            Some("m1"),
+            "write",
+            &serde_json::json!({
+                "path": "docs/note.md",
+                "content": "# Sprint notes\n\n- shipped the panel\n- **bold** item\n"
+            }),
+        );
+        s.tool_end(Some("m1"), "write", "ok", false);
+        let text = flat_text(&s.chat_lines(100));
+        assert!(text.contains("markdown · 4 line(s)"), "{text}");
+        assert!(text.contains("Sprint notes"), "heading rendered: {text}");
+        assert!(!text.contains("# Sprint notes"), "hashes stripped: {text}");
+        assert!(text.contains("shipped the panel"), "list rendered: {text}");
+        assert!(!text.contains("- shipped"), "list marker stripped: {text}");
     }
 
     #[test]
@@ -6152,6 +6901,9 @@ mod panel_tests {
             Some(30),
             false,
             None,
+            None,
+            None,
+            None,
         );
         assert!(
             lines.len() >= 4,
@@ -6183,6 +6935,9 @@ mod panel_tests {
             Some(1800),
             true,
             None,
+            None,
+            None,
+            None,
         );
         for l in &lines {
             let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
@@ -6209,6 +6964,9 @@ mod panel_tests {
             Some(93),
             Some(1800),
             true,
+            None,
+            None,
+            None,
             None,
         );
         let text = lines
