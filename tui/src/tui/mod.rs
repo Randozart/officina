@@ -7,7 +7,9 @@ pub mod engine_config;
 pub mod janitor;
 pub mod layout;
 pub mod paste;
+pub mod question;
 pub mod review;
+pub mod routes;
 pub mod state;
 
 use std::io::{self, IsTerminal};
@@ -536,6 +538,7 @@ async fn run_loop(
         let dt = now.duration_since(last_frame).as_secs_f64();
         last_frame = now;
         state.apply_liveliness_gate();
+        state.question_poll();
         state.step_fire(dt);
         terminal.draw(|frame| render(frame, state))?;
 
@@ -669,6 +672,7 @@ async fn run_loop(
                             && !state.queued_prompts.is_empty()
                         {
                             let message = state.queued_prompts.remove(0);
+                            state.held_resolve_queued();
                             let _ = bridge
                                 .request(RpcCommand::Prompt {
                                     id: None,
@@ -1370,6 +1374,27 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
         return;
     }
 
+    // /routes — decision trail; esc/q closes, arrows/pg scroll.
+    if state.routes_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                state.note_phase(state::UiEvent::CloseModal);
+                state.routes_open = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.routes_sel = state.routes_sel.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.routes_sel = state.routes_sel.saturating_add(1)
+            }
+            KeyCode::PageUp => state.routes_sel = state.routes_sel.saturating_sub(10),
+            KeyCode::PageDown => state.routes_sel = state.routes_sel.saturating_add(10),
+            KeyCode::Home | KeyCode::Char('g') => state.routes_sel = 0,
+            KeyCode::End | KeyCode::Char('G') => state.routes_sel = usize::MAX,
+            _ => {}
+        }
+        return;
+    }
     // /cost — read-only rows; esc/q closes.
     if state.cost_open {
         match key.code {
@@ -1552,6 +1577,29 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
         return;
     }
 
+    // Question panel (2026-11-13): top priority when visible — the
+    // operator's answer goes to the staged question, nothing else.
+    if state.question.is_some() {
+        match key.code {
+            KeyCode::Esc => state.question_cancel(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.question_sel = state.question_sel.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => state.question_sel += 1,
+            KeyCode::Enter => state.question_answer(),
+            KeyCode::Char(c @ '1'..='9') => state.question_pick((c as u8 - b'0') as usize),
+            _ => {}
+        }
+        let n = state
+            .question
+            .as_ref()
+            .map(|q| q.options.len())
+            .unwrap_or(0);
+        if state.question_sel >= n {
+            state.question_sel = n.saturating_sub(1);
+        }
+        return;
+    }
     match key.code {
         // ^esc — quit. The only physical quit chord (owner-approved; some
         // desktops reserve it, /quit always works). MUST precede the plain
@@ -1563,7 +1611,12 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
         }
         KeyCode::Esc => {
             if state.is_streaming {
+                // Arm the settle deadline: if pi never confirms with
+                // agent_end, the watchdog releases the UI instead of
+                // spinning forever (2026-11-13, operator report).
                 let _ = bridge.request(RpcCommand::Abort { id: None }).await;
+                state.abort_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
             }
             // Idle Esc: close-overlays is handled above (modals); here it
             // is a deliberate NO-OP — it used to quit (owner report:
@@ -1729,6 +1782,7 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
                 state.push_user(msg.clone());
             }
             if state.is_streaming {
+                state.held_push(&msg, state::HeldKind::FollowUp);
                 let _ = bridge
                     .request(RpcCommand::FollowUp {
                         id: None,
@@ -1859,6 +1913,14 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
                 state.answers_open_modal();
                 return;
             }
+            // /routes — Caduceus decision trail (read-only facts file).
+            if msg == "/routes" {
+                state.routes = Some(crate::tui::routes::load_recent(&chrono_day(), 400));
+                state.routes_sel = 0;
+                state.note_phase(state::UiEvent::OpenModal);
+                state.routes_open = true;
+                return;
+            }
             // /cost — today's routing ledger + budget bars (read-only).
             if msg == "/cost" {
                 let day = chrono_day();
@@ -1879,7 +1941,7 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
                     Ok(list) => state.xsessions_open_with(list),
                     Err(e) => state
                         .entries
-                        .push(state::ChatEntry::Diag(format!("session scan failed: {e}"))),
+                        .push(state::ChatEntry::Error(format!("session scan failed: {e}"))),
                 }
                 return;
             }
@@ -2096,7 +2158,7 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
                             _ => {
                                 state
                                     .entries
-                                    .push(state::ChatEntry::Diag("session scan failed".into()));
+                                    .push(state::ChatEntry::Error("session scan failed".into()));
                             }
                         }
                     }
@@ -2114,6 +2176,7 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
                     // the message in memory and never persists it. Deliver it
                     // as a fresh Prompt once this turn settles (watchdog or
                     // normal completion). Images stay staged (I5).
+                    state.held_push(&msg, state::HeldKind::Queued);
                     state.queued_prompts.push(msg);
                     let img_note = if state.pending_images.is_empty() {
                         String::new()
@@ -2126,6 +2189,7 @@ async fn handle_key(key: KeyEvent, state: &mut AppState, bridge: &mut RpcBridge)
                     ));
                 } else {
                     let images = images_for_send(state);
+                    state.held_push(&msg, state::HeldKind::Steer);
                     let _ = bridge
                         .request(RpcCommand::Steer {
                             id: None,
@@ -2268,7 +2332,7 @@ async fn import_opencode(
         Ok(Ok(out)) if out.status.success() => out,
         Ok(Ok(out)) => {
             let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            state.entries.push(state::ChatEntry::Diag(format!(
+            state.entries.push(state::ChatEntry::Error(format!(
                 "import failed: {}",
                 if err.is_empty() {
                     format!("exit {:?}", out.status.code())
@@ -2279,7 +2343,7 @@ async fn import_opencode(
             return;
         }
         Ok(Err(e)) => {
-            state.entries.push(state::ChatEntry::Diag(format!(
+            state.entries.push(state::ChatEntry::Error(format!(
                 "import failed to run node: {e}"
             )));
             return;
@@ -2287,7 +2351,7 @@ async fn import_opencode(
         Err(e) => {
             state
                 .entries
-                .push(state::ChatEntry::Diag(format!("import task failed: {e}")));
+                .push(state::ChatEntry::Error(format!("import task failed: {e}")));
             return;
         }
     };
@@ -2419,10 +2483,33 @@ async fn cancel_pending_dialogs(state: &mut AppState, bridge: &mut RpcBridge) {
 /// threshold, cancel any blocking dialog, abort once, and (if the abort also
 /// fails to settle) surface an explicit restart hint.
 async fn maybe_tool_watchdog(state: &mut AppState, bridge: &mut RpcBridge) {
+    let now = std::time::Instant::now();
+
+    // Abort-settle deadline runs even with the tool watchdog disabled: an
+    // unresponsive abort must never leave 'working…' spinning forever
+    // (2026-11-13, operator report).
+    if state.abort_deadline.is_some_and(|deadline| now >= deadline) {
+        state.abort_deadline = None;
+        state.note_phase(state::UiEvent::AgentEnd);
+        state.is_streaming = false;
+        state.is_compacting = false;
+        state.expected_tool_calls.clear();
+        let abandoned = state.abandon_running_tools("abort did not settle — released");
+        state.entries.push(state::ChatEntry::Warn(format!(
+            "harness watchdog: abort did not settle after 10s — UI released{}; \
+             the pi child may still be finishing in the background. If it stays \
+             unresponsive, /quit then relaunch Officina.",
+            if abandoned > 0 {
+                format!(", {abandoned} tool call(s) marked cancelled")
+            } else {
+                String::new()
+            }
+        )));
+    }
+
     if state.tool_watchdog_secs == 0 {
         return;
     }
-    let now = std::time::Instant::now();
     let mut stalled = false;
 
     // Stage 0: an assistant turn announced a tool call, but pi never emitted
@@ -2431,7 +2518,7 @@ async fn maybe_tool_watchdog(state: &mut AppState, bridge: &mut RpcBridge) {
     let start_limit = std::time::Duration::from_secs(state.tool_watchdog_secs.min(60).max(15));
     if let Some((id, age)) = state.oldest_expected_tool_call() {
         if age >= start_limit && state.watchdog_fired.insert(format!("expected:{id}")) {
-            state.entries.push(state::ChatEntry::Diag(format!(
+            state.entries.push(state::ChatEntry::Warn(format!(
                 "harness watchdog: tool call {} never started after {}s — cancelling and aborting the turn",
                 id.chars().take(8).collect::<String>(),
                 age.as_secs()
@@ -2447,7 +2534,7 @@ async fn maybe_tool_watchdog(state: &mut AppState, bridge: &mut RpcBridge) {
             .map(|s| std::time::Duration::from_secs(s.saturating_add(60)))
             .map_or(base, |t| t.max(base));
         if age >= limit && state.watchdog_fired.insert(key) {
-            state.entries.push(state::ChatEntry::Diag(format!(
+            state.entries.push(state::ChatEntry::Warn(format!(
                 "harness watchdog: {name} idle {}s with no result — cancelling and aborting the turn",
                 age.as_secs()
             )));
@@ -2461,15 +2548,6 @@ async fn maybe_tool_watchdog(state: &mut AppState, bridge: &mut RpcBridge) {
         cancel_pending_dialogs(state, bridge).await;
         let _ = bridge.request(RpcCommand::Abort { id: None }).await;
         state.abort_deadline = Some(now + std::time::Duration::from_secs(10));
-    }
-
-    if state.abort_deadline.is_some_and(|deadline| now >= deadline) {
-        state.abort_deadline = None;
-        state.entries.push(state::ChatEntry::Diag(
-            "harness watchdog: abort did not settle (pi child may be stuck). \
-             Session is preserved; /quit then relaunch Officina to repair it."
-                .to_string(),
-        ));
     }
 }
 
@@ -2605,6 +2683,16 @@ async fn handle_mouse(m: crossterm::event::MouseEvent, state: &mut AppState) {
         // Text selection (owner request 2026-09-03): left-drag across the
         // transcript anchors a row range; ^c copies it. Plain click clears.
         MouseEventKind::Down(MouseButton::Left) => {
+            // Thinking blocks (2026-11-13): a click inside a block closes
+            // or reopens the trace instead of starting a selection.
+            if !over_sidebar(state, m.column, m.row) && state.thinking_toggle_at(m.row) {
+                return;
+            }
+            // Tool blocks (2026-11-13): click opens the full args/output,
+            // click again collapses to the one-line form.
+            if !over_sidebar(state, m.column, m.row) && state.tool_toggle_at(m.row) {
+                return;
+            }
             state.clear_selection();
             if let Some(a) = state.last_chat_area {
                 if m.row >= a.y && m.row < a.y + a.height {
@@ -2762,7 +2850,7 @@ fn session_tree_lines(tree: &[serde_json::Value]) -> Vec<(String, String)> {
 fn handle_response(state: &mut AppState, resp: &crate::rpc::protocol::RpcResponse) -> bool {
     if resp.success != Some(true) {
         if let Some(err) = &resp.error {
-            state.entries.push(state::ChatEntry::Diag(format!(
+            state.entries.push(state::ChatEntry::Error(format!(
                 "rpc {} failed: {}",
                 resp.command.as_deref().unwrap_or("?"),
                 err
@@ -2925,7 +3013,7 @@ fn handle_response(state: &mut AppState, resp: &crate::rpc::protocol::RpcRespons
                 })
                 .unwrap_or_default();
             if models.is_empty() {
-                state.entries.push(state::ChatEntry::Diag(
+                state.entries.push(state::ChatEntry::Error(
                     "no models available — check provider/auth".to_string(),
                 ));
                 state.models_open = false;
@@ -3044,6 +3132,8 @@ fn handle_event(state: &mut AppState, event_type: &str, fields: &serde_json::Val
         "agent_start" => {
             state.note_phase(state::UiEvent::AgentStart);
             state.is_streaming = true;
+            // A follow-up typed while idle became this turn.
+            state.held_clear(Some(state::HeldKind::FollowUp));
             state.watchdog_fired.clear();
             state.abort_deadline = None;
             state.expected_tool_calls.clear();
@@ -3052,6 +3142,7 @@ fn handle_event(state: &mut AppState, event_type: &str, fields: &serde_json::Val
             state.mark_activity();
             state.note_phase(state::UiEvent::AgentEnd);
             state.is_streaming = false;
+            state.held_clear(None);
             state.refresh_ghost();
             state.refresh_answers_notice();
             state.abort_deadline = None;
@@ -3068,6 +3159,11 @@ fn handle_event(state: &mut AppState, event_type: &str, fields: &serde_json::Val
                     abandoned + expected
                 )));
             }
+        }
+        "message_start" => {
+            // A steered message is inserted at the next step; the wire
+            // opening a message means it landed (2026-11-13).
+            state.held_clear(Some(state::HeldKind::Steer));
         }
         "message_update" => {
             state.mark_activity();
@@ -3101,7 +3197,7 @@ fn handle_event(state: &mut AppState, event_type: &str, fields: &serde_json::Val
                     let text = content_text(content);
                     let have_streamed = matches!(&state.entries.last(), Some(e)
                         if matches!(e, state::ChatEntry::Assistant(t) if !t.is_empty())
-                            || matches!(e, state::ChatEntry::Thinking(t) if !t.is_empty()));
+                            || matches!(e, state::ChatEntry::Thinking { text: t, .. } if !t.is_empty()));
                     if !text.is_empty() && !have_streamed {
                         state.entries.push(state::ChatEntry::Assistant(text));
                     }
@@ -3221,12 +3317,14 @@ fn handle_event(state: &mut AppState, event_type: &str, fields: &serde_json::Val
         "compaction_start" => {
             state.note_phase(state::UiEvent::CompactionStart);
             state.is_compacting = true;
+            state.compaction_started_at = Some(std::time::Instant::now());
             // Re-arm the one-shot auto-continue for THIS compaction.
             state.compaction_auto_armed = true;
         }
         "compaction_end" => {
             state.note_phase(state::UiEvent::CompactionEnd);
             state.is_compacting = false;
+            state.compaction_started_at = None;
             let reason = fields.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             let will_retry = fields
                 .get("willRetry")
@@ -3245,7 +3343,7 @@ fn handle_event(state: &mut AppState, event_type: &str, fields: &serde_json::Val
                 // the owner saw "compacted and stopped" with no explanation.
                 state
                     .entries
-                    .push(state::ChatEntry::Diag(format!("compaction failed: {}", e)));
+                    .push(state::ChatEntry::Error(format!("compaction failed: {}", e)));
             } else {
                 let result = fields.get("result");
                 let before = result
@@ -3273,11 +3371,19 @@ fn handle_event(state: &mut AppState, event_type: &str, fields: &serde_json::Val
             // DESIGN (pi agent-session.js: "user continues manually") — fire
             // the one-shot continuation. Overflow compactions already
             // auto-retry; aborted/failed ones have nothing to continue.
+            // GRIND handoff (2026-11-14): the grind extension owns the
+            // post-compaction continuation while that mode is active — two
+            // continuation prompts would race.
+            let grind_active = state
+                .agent_mode_label
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case("GRIND"));
             let fire = !aborted
                 && !will_retry
                 && err.is_none()
                 && reason == "threshold"
-                && state.compaction_auto_armed;
+                && state.compaction_auto_armed
+                && !grind_active;
             state.compaction_auto_armed = false;
             if fire {
                 state.entries.push(state::ChatEntry::Diag(
@@ -3749,6 +3855,41 @@ mod compaction_tests {
     }
 
     #[test]
+    fn grind_mode_owns_the_post_compaction_continuation() {
+        // 2026-11-14: the grind extension re-prompts on agent_end; the TUI
+        // must not fire its own continuation under GRIND (double turns).
+        let mut s = AppState::default();
+        s.agent_mode_label = Some("GRIND".into());
+        handle_event(
+            &mut s,
+            "compaction_start",
+            &ev(serde_json::json!({ "reason": "threshold" })),
+        );
+        let fired = handle_event(
+            &mut s,
+            "compaction_end",
+            &ev(serde_json::json!({
+                "reason": "threshold", "aborted": false, "willRetry": false
+            })),
+        );
+        assert!(!fired, "TUI continues nothing while GRIND is active");
+        assert!(!s.compaction_auto_armed, "one-shot still consumed");
+        // A non-GRIND label keeps the old behaviour (parity, I5).
+        let mut b = AppState::default();
+        b.agent_mode_label = Some("BUILD".into());
+        handle_event(
+            &mut b,
+            "compaction_start",
+            &ev(serde_json::json!({ "reason": "threshold" })),
+        );
+        assert!(handle_event(
+            &mut b,
+            "compaction_end",
+            &ev(serde_json::json!({ "reason": "threshold", "willRetry": false })),
+        ));
+    }
+
+    #[test]
     fn threshold_compaction_fires_auto_continue_once() {
         let mut s = AppState::default();
         // Start arms the one-shot.
@@ -3782,7 +3923,9 @@ mod compaction_tests {
             .entries
             .iter()
             .filter_map(|e| match e {
-                state::ChatEntry::Diag(t) => Some(t.clone()),
+                state::ChatEntry::Diag(t)
+                | state::ChatEntry::Warn(t)
+                | state::ChatEntry::Error(t) => Some(t.clone()),
                 _ => None,
             })
             .collect();
@@ -3819,7 +3962,9 @@ mod compaction_tests {
             .entries
             .iter()
             .filter_map(|e| match e {
-                state::ChatEntry::Diag(t) => Some(t.clone()),
+                state::ChatEntry::Diag(t)
+                | state::ChatEntry::Warn(t)
+                | state::ChatEntry::Error(t) => Some(t.clone()),
                 _ => None,
             })
             .collect();
@@ -3866,6 +4011,44 @@ mod phase_wiring_tests {
             "normal turn must not trip the table: {:?}",
             state_diags(&s)
         );
+    }
+
+    #[test]
+    fn compaction_timer_tracks_the_banner() {
+        let mut s = AppState::default();
+        fire(&mut s, "agent_start");
+        assert!(s.compaction_started_at.is_none());
+        fire(&mut s, "compaction_start");
+        assert!(s.is_compacting);
+        assert!(s.compaction_started_at.is_some(), "banner timer armed");
+        fire(&mut s, "compaction_end");
+        assert!(!s.is_compacting);
+        assert!(s.compaction_started_at.is_none(), "banner timer cleared");
+        fire(&mut s, "agent_end");
+    }
+
+    #[test]
+    fn held_messages_are_tracked_until_they_land() {
+        let mut s = AppState::default();
+        s.held_push("steer me", state::HeldKind::Steer);
+        s.held_push("later please", state::HeldKind::FollowUp);
+        s.held_push("behind the tool", state::HeldKind::Queued);
+        let label = s.held_label().expect("held label");
+        assert!(label.contains("steering: “steer me”"), "{label}");
+        assert!(label.contains("(+2 more)"), "{label}");
+        // A message_start means the steer landed.
+        fire(&mut s, "message_start");
+        assert!(!s.held.iter().any(|h| h.kind == state::HeldKind::Steer));
+        // Delivery of the queued prompt resolves exactly one queue entry.
+        s.held_resolve_queued();
+        assert!(!s.held.iter().any(|h| h.kind == state::HeldKind::Queued));
+        assert!(s.held.iter().any(|h| h.kind == state::HeldKind::FollowUp));
+        // A new turn consumes the follow-up; turn end clears everything.
+        fire(&mut s, "agent_start");
+        assert!(s.held.is_empty());
+        s.held_push("late", state::HeldKind::Steer);
+        fire(&mut s, "agent_end");
+        assert!(s.held.is_empty());
     }
 
     #[test]

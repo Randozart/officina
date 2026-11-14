@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::ansi;
-use super::state::{AppState, DialogKind};
+use super::state::{AppState, ChatEntry, DialogKind};
 use crate::theme;
 
 const SIDEBAR_W: u16 = 42;
@@ -49,6 +49,7 @@ fn mode_chip(label: &str) -> Option<(&'static str, ratatui::style::Color)> {
         "BUILD" => Some(("☉", theme::GOLD)),
         "INQUIRE" => Some(("?", theme::GREEN)),
         "STEER" => Some(("↝", theme::ORANGE)),
+        "GRIND" => Some(("∞", theme::VIOLET)),
         _ => None,
     }
 }
@@ -337,6 +338,11 @@ fn render_main(frame: &mut Frame, state: &mut AppState, area: Rect) {
         render_cost_modal(frame, state, area);
         return;
     }
+    if state.routes_open {
+        render_chat_and_editor(frame, state, area);
+        render_routes_modal(frame, state, area);
+        return;
+    }
     if state.xsessions_open {
         render_chat_and_editor(frame, state, area);
         render_xsessions_modal(frame, state, area);
@@ -489,11 +495,24 @@ fn render_chat_and_editor(frame: &mut Frame, state: &mut AppState, area: Rect) {
     }
     if state.is_compacting {
         // Compaction is a status, not a warning — informational voice.
+        // Spinner + elapsed so it never reads as a freeze (2026-11-13).
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let f = (state.started.elapsed().as_millis() / 120) as usize % frames.len();
+        let secs = state
+            .compaction_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
         lines.push(Line::from(Span::styled(
-            format!("  {} compacting context…", theme::GLYPH_ALEMBIC),
+            format!(
+                "  {} {} compacting context… {secs}s",
+                theme::GLYPH_ALEMBIC,
+                frames[f]
+            ),
             theme::info(),
         )));
     }
+    // Trailing status lines have no entry — keep the map aligned (hitboxes).
+    state.line_entries.resize(lines.len(), usize::MAX);
 
     let visible = chat_area.height as usize;
 
@@ -507,8 +526,104 @@ fn render_chat_and_editor(frame: &mut Frame, state: &mut AppState, area: Rect) {
     if state.scroll > max_scroll {
         state.scroll = max_scroll;
     }
-    let start = total.saturating_sub(visible + state.scroll as usize);
+    // Scroll lock (2026-11-13, operator request): while scrolled back the
+    // top line is pinned by absolute index — streaming below never drags
+    // the text being read. Reaching the tail re-engages follow mode.
+    let max_start = total.saturating_sub(visible);
+    let start = if state.scroll == 0 {
+        state.scroll_lock = None;
+        max_start
+    } else {
+        let anchor = state.scroll_lock.unwrap_or(state.last_start);
+        let locked = anchor.min(max_start);
+        if locked >= max_start {
+            state.scroll_follow();
+            max_start
+        } else {
+            state.scroll_lock = Some(locked);
+            locked
+        }
+    };
+    state.last_start = start;
+    state.last_chat_total = total;
     let view: Vec<Line> = lines.into_iter().skip(start).collect();
+
+    // Scrolled-back hint + click target (2026-11-13): the breathing row
+    // between transcript and prompt says the view is locked and offers a
+    // one-click jump back to the live tail.
+    state.tail_hint_area = None;
+    if chat_area.height > 0 {
+        let hint = Rect {
+            y: chat_area.y + chat_area.height,
+            height: 1,
+            ..chat_area
+        };
+        if let Some(held) = state.held_label() {
+            // Held messages (2026-11-13, operator request): what was typed
+            // while the agent is busy, until the agent reaches it.
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    format!("  ⏳ held — {held} · inserted when the agent reaches it"),
+                    Style::new().fg(theme::GOLD).bg(theme::BG),
+                ))),
+                hint,
+            );
+        } else if state.scroll > 0 {
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        "  {}▲ scrolled back {} rows — press END to go back to bottom",
+                        theme::GLYPH_ALEMBIC,
+                        state
+                            .last_chat_total
+                            .saturating_sub(state.last_start + visible as usize)
+                    ),
+                    Style::new().fg(theme::MUTED).bg(theme::BG),
+                ))),
+                hint,
+            );
+            state.tail_hint_area = Some(hint);
+        }
+    }
+
+    // Thinking-block hitboxes (2026-11-13): a left click on any row of a
+    // block toggles collapse. Rows are screen coords of the visible
+    // window; rebuilt every frame from the line→entry map.
+    state.thinking_hitboxes.clear();
+    state.tool_hitboxes.clear();
+    if visible > 0 {
+        let last_visible = (start + visible - 1).min(state.line_entries.len().saturating_sub(1));
+        let mut i = 0usize;
+        while i < state.line_entries.len() {
+            let idx = state.line_entries[i];
+            let mut j = i;
+            while j + 1 < state.line_entries.len() && state.line_entries[j + 1] == idx {
+                j += 1;
+            }
+            let kind = state.entries.get(idx).map(|e| match e {
+                ChatEntry::Thinking { .. } => 1u8,
+                ChatEntry::Tool { .. } => 2,
+                _ => 0,
+            });
+            if let Some(kind) = kind.filter(|k| *k != 0) {
+                let lo = i.max(start);
+                let hi = j.min(last_visible);
+                if lo <= hi {
+                    let range = (
+                        chat_area.y + (lo - start) as u16,
+                        chat_area.y + (hi - start) as u16,
+                        idx,
+                    );
+                    if kind == 1 {
+                        state.thinking_hitboxes.push(range);
+                    } else {
+                        state.tool_hitboxes.push(range);
+                    }
+                }
+            }
+            i = j + 1;
+        }
+    }
 
     // Composer flames (owner request 2026-09-02): braille alchemical fire
     // rising from the editor's top edge; intensity = GPU load (low-passed
@@ -539,6 +654,119 @@ fn render_chat_and_editor(frame: &mut Frame, state: &mut AppState, area: Rect) {
     } else {
         Vec::new()
     };
+
+    // Compaction banner (2026-11-13, operator request): a bordered card
+    // above the prompt — impossible to miss, works at any scroll depth.
+    if state.is_compacting {
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let f = (state.started.elapsed().as_millis() / 120) as usize % frames.len();
+        let secs = state
+            .compaction_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let panel_w = area.width.min(64);
+        let panel_h = 4u16.min(area.height.saturating_sub(2));
+        let panel = Rect {
+            x: area.x + area.width.saturating_sub(panel_w) / 2,
+            y: input_area.y.saturating_sub(panel_h + 1),
+            width: panel_w,
+            height: panel_h,
+        };
+        frame.render_widget(ratatui::widgets::Clear, panel);
+        let edge = Style::new().fg(theme::GREEN).bg(theme::PANEL);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(edge)
+            .style(Style::new().bg(theme::PANEL))
+            .title(Line::from(Span::styled(
+                format!(" {} compacting context — {secs}s ", frames[f]),
+                Style::new()
+                    .fg(theme::GREEN)
+                    .bg(theme::PANEL)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        let inner = block.inner(panel);
+        frame.render_widget(block, panel);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "summarizing the session to free context",
+                    Style::new().fg(theme::TEXT).bg(theme::PANEL),
+                )),
+                Line::from(Span::styled(
+                    "the next turn continues on its own — no action needed",
+                    Style::new().fg(theme::MUTED).bg(theme::PANEL),
+                )),
+            ])
+            .style(Style::new().bg(theme::PANEL)),
+            inner,
+        );
+    }
+
+    // Question panel (2026-11-13): the ask extension stages question.json;
+    // the TUI renders the operator's menu ON TOP OF THE PROMPT — exactly
+    // where their eyes already are. Enter answers, esc cancels, digits
+    // quick-pick. Disappears the moment the answer is written.
+    if state.question.is_some() {
+        let q = state.question.as_ref().unwrap();
+        let panel_w = area.width.min(72);
+        let opt_h = q.options.len() as u16;
+        let panel_h = (opt_h + 5).min(area.height.saturating_sub(4));
+        let panel = Rect {
+            x: area.x + area.width.saturating_sub(panel_w) / 2,
+            y: input_area.y.saturating_sub(panel_h + 1),
+            width: panel_w,
+            height: panel_h,
+        };
+        frame.render_widget(ratatui::widgets::Clear, panel);
+        let edge = Style::new().fg(theme::GREEN).bg(theme::PANEL);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(theme::GREEN).bg(theme::PANEL))
+            .title(Span::styled(
+                format!(" {} question ", theme::GLYPH_AI),
+                Style::new()
+                    .fg(theme::GREEN)
+                    .bg(theme::PANEL)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::new().bg(theme::PANEL));
+        let inner = block.inner(panel);
+        frame.render_widget(block, panel);
+        if inner.height >= 1 && inner.width >= 20 {
+            let mut qlines: Vec<Line> = Vec::new();
+            let qw = inner.width.saturating_sub(2) as usize;
+            for seg in crate::tui::state::wrap_text(&q.question, qw) {
+                qlines.push(Line::from(Span::styled(
+                    format!(" {seg}"),
+                    Style::new().fg(theme::TEXT).bg(theme::PANEL),
+                )));
+            }
+            let visible_opts = inner
+                .height
+                .saturating_sub(qlines.len() as u16)
+                .min(opt_h.max(1));
+            for (i, opt) in q.options.iter().enumerate() {
+                let sel = i == state.question_sel;
+                let marker = if sel { "▸" } else { " " };
+                let st = if sel {
+                    Style::new().fg(theme::BG).bg(theme::GREEN)
+                } else {
+                    Style::new().fg(theme::TEXT).bg(theme::PANEL)
+                };
+                qlines.push(Line::from(Span::styled(
+                    format!(" {marker}{} {opt}", i + 1),
+                    st,
+                )));
+            }
+            qlines.truncate(inner.height as usize);
+            frame.render_widget(
+                Paragraph::new(qlines).style(Style::new().bg(theme::PANEL)),
+                inner,
+            );
+        }
+    }
 
     // Gap row: explicit BG paint, ALWAYS (owner request 2026-09-03 — the
     // terminal background must never peek through below the panels). It now
@@ -1940,6 +2168,126 @@ fn render_answers_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
 
 /// /cost (exec-infra stage 5) — today's route ledger + budget bars.
 /// Euro appears only when the ledger itself carried costEstimate (I5).
+fn render_routes_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let h = area.height.min(30);
+    let w = area.width.min(116);
+    let modal = Rect {
+        y: area.y + area.height.saturating_sub(h + 1),
+        x: area.x,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, modal);
+    let day = state
+        .routes
+        .as_ref()
+        .map(|r| r.day.clone())
+        .unwrap_or_else(|| "—".to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::GOLD).bg(theme::PANEL))
+        .title(Span::styled(
+            format!(" 🜍 caduceus decisions · {day} (newest first) "),
+            Style::new()
+                .fg(theme::GOLD)
+                .bg(theme::PANEL)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(theme::PANEL));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.width < 60 || inner.height < 4 {
+        return;
+    }
+    let Some(report) = state.routes.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  no route ledger for today",
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            ))),
+            inner,
+        );
+        return;
+    };
+    if report.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  no decisions recorded today",
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            ))),
+            inner,
+        );
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {:<9}{:<7}{:<6}{:<42}{:<10}{:<7}{:>7}  {:>9}",
+            "time", "tier", "state", "model", "reason", "local", "latency", "tokens"
+        ),
+        Style::new().fg(theme::MUTED).bg(theme::PANEL),
+    )));
+    let visible = (inner.height as usize).saturating_sub(2);
+    let total = report.entries.len();
+    let max_sel = total.saturating_sub(visible);
+    if state.routes_sel > max_sel {
+        state.routes_sel = max_sel;
+    }
+    let sel = state.routes_sel;
+    for (i, e) in report.entries.iter().enumerate().skip(sel).take(visible) {
+        let latest = i == 0;
+        let marker = if latest { "▸" } else { " " };
+        let state_style = if e.outcome == "ok" {
+            Style::new().fg(theme::GREEN).bg(theme::PANEL)
+        } else {
+            Style::new().fg(theme::ORANGE).bg(theme::PANEL)
+        };
+        let tier_style = if e.tier == "local" {
+            Style::new().fg(theme::GREEN).bg(theme::PANEL)
+        } else {
+            Style::new().fg(theme::GOLD).bg(theme::PANEL)
+        };
+        let model = format!("{}/{}", e.provider, e.model);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} {:<9}", marker, crate::tui::routes::short_time(&e.ts)),
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            ),
+            Span::styled(format!("{:<7}", e.tier), tier_style),
+            Span::styled(format!("{:<6}", e.outcome), state_style),
+            Span::styled(
+                format!("{:<42}", trunc(&model, 42)),
+                Style::new().fg(theme::TEXT).bg(theme::PANEL),
+            ),
+            Span::styled(
+                format!("{:<10}", trunc(&e.reason, 10)),
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            ),
+            Span::styled(
+                format!("{:<7}", trunc(&e.local_state, 7)),
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            ),
+            Span::styled(
+                format!("{:>6.1}s", e.latency_ms as f64 / 1000.0),
+                Style::new().fg(theme::TEXT).bg(theme::PANEL),
+            ),
+            Span::styled(
+                format!("  {:>4}→{:<4}", e.tokens_in, e.tokens_out),
+                Style::new().fg(theme::MUTED).bg(theme::PANEL),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  {} decisions · ↑↓ scroll · esc closes", total),
+        Style::new().fg(theme::MUTED).bg(theme::PANEL),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(theme::PANEL)),
+        inner,
+    );
+}
+
 fn render_cost_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let h = area.height.min(30);
     let w = area.width.min(96);
@@ -3148,12 +3496,12 @@ fn render_tools_modal(frame: &mut Frame, state: &mut AppState, area: Rect) {
                     Style::new().fg(theme::MUTED),
                 ),
             };
-            (name.to_string(), status, st)
+            (crate::tui::state::tool_display_name(name), status, st)
         };
         if selected {
             lines.push(Line::from(Span::styled(
                 trunc(
-                    &format!("▸ {:<8} {}", label, status),
+                    &format!("▸ {:<16} {}", label, status),
                     (inner.width as usize).saturating_sub(1),
                 ),
                 Style::new()
@@ -3633,6 +3981,29 @@ mod render_smoke {
             s.cost_open = true;
             s.cost = Some(crate::tui::cost::CostReport::default());
             draw_at(&mut s, w, h);
+            // routes modal (decision trail, incl. an empty ledger)
+            let mut s = base_state();
+            s.routes_open = true;
+            s.routes = Some(crate::tui::routes::RouteReport::default());
+            draw_at(&mut s, w, h);
+            s.routes = Some(crate::tui::routes::RouteReport {
+                day: "20261114".into(),
+                entries: vec![crate::tui::routes::RouteEntry {
+                    ts: "2026-11-14T09:28:51.223Z".into(),
+                    reason: "user".into(),
+                    tier: "cloud".into(),
+                    provider: "caduceus".into(),
+                    model: "opencode-go/deepseek-v4.1-flash".into(),
+                    profile: "auto".into(),
+                    local_state: "down".into(),
+                    latency_ms: 17_908,
+                    tokens_in: 3536,
+                    tokens_out: 1319,
+                    cost_estimate: 0.0,
+                    outcome: "ok".into(),
+                }],
+            });
+            draw_at(&mut s, w, h);
             // review findings
             let mut s = base_state();
             s.review_open = true;
@@ -3699,5 +4070,23 @@ mod render_smoke {
         for (w, h) in [(40u16, 12u16), (100, 30)] {
             draw_at(&mut s, w, h);
         }
+    }
+}
+
+#[cfg(test)]
+mod grind_chip_tests {
+    use super::*;
+
+    #[test]
+    fn grind_mode_gets_its_own_alchemical_chip() {
+        assert_eq!(mode_chip("GRIND"), Some(("∞", theme::VIOLET)));
+        assert_eq!(mode_chip("grind"), Some(("∞", theme::VIOLET)));
+        let mut s = AppState::default();
+        s.agent_mode_label = Some("GRIND".into());
+        s.agent_mode_glyph = Some("∞".into());
+        let title = composer_title(&s).expect("chip present");
+        let text: String = title.iter().map(|sp| sp.content.to_string()).collect();
+        assert!(text.contains("GRIND"), "{text}");
+        assert!(text.contains('∞'), "{text}");
     }
 }

@@ -11,13 +11,57 @@
 - **Prompt history**: **↑/↓** step through earlier prompts (persisted at
   `~/.vitriol/officina/input-history.jsonl`); stepping past the newest
   entry restores your in-progress draft.
-- **Agent modes**: TAB cycles **BUILD → STEER → INQUIRE → PLAN**. STEER
-  (copper) applies a course correction to the work in flight and keeps
-  going. INQUIRE (green) answers and steers without acting — its replies
-  land in `/answers` (scrollable panel, also pinged after each turn).
-  PLAN is research-only (`*.md` writes); BUILD unlocks writes.
-- **Clarifying questions**: the model's question tool opens a real modal
-  (options + "Type something." free text) in every agent mode.
+- **Agent modes**: TAB cycles **BUILD → GRIND → STEER → INQUIRE → PLAN**.
+  GRIND (violet, ∞) is a persistent build: writes unlocked like BUILD, and
+  the harness re-prompts until the model finishes with `GRIND: DONE` (task
+  list empty + changes verified) or `GRIND: BLOCKED: <reason>`. Verify
+  runs on a DONE claim and every 3rd continuation; caps: 24 continuations
+  / 120 min (`OFFICINA_GRIND_MAX_TURNS`, `OFFICINA_GRIND_MAX_MINUTES`);
+  any input while the loop runs, Esc, or switching modes stands it down;
+  `OFFICINA_NO_GRIND=1` removes it. STEER (amber) applies a course
+  correction to the work in flight and keeps going. INQUIRE (green)
+  answers and steers without acting — its replies land in `/answers`
+  (scrollable panel, also pinged after each turn). PLAN is research-only
+  (`*.md` writes); BUILD unlocks writes.
+- **Clarifying questions**: the model's question tool opens a menu
+  directly on top of the prompt (options list; the RPC path stages it as
+  a facts file, so it works on every lane and can never hang the wire).
+  No response in 10 minutes fail-opens; esc cancels.
+- **Colour semantics** (2026-11-14): cyan = active (running tools, working),
+  green = success/healthy, gold = completed work/accents, amber = observation
+  worth a look (watchdog HUNG, warnings — no longer red-looking), red = real
+  failure only. Informational transcript notices are neutral; `Warn` is
+  amber, `Error` is red. Watchdog cards tint by verdict (ALIVE green,
+  JUDGING gold, HUNG amber) and update in place for identical facts.
+- **Thinking traces**: rendered as dimmed markdown (headings, bold,
+  code, lists). Click any thinking block to close it — it collapses to a
+  one-line marker with its character count; click again to reopen.
+  Tool calls work the same way: click a tool block to open the full args
+  and output, click again to collapse to the one-line form (per-block; the
+  `/tools` default is untouched). Tool blocks show formal titles ("Update
+  Tasks", "Scratchpad Write", "List Directory"); args render as key/value
+  rows — the clicked view lists every field (no raw JSON).
+  `/thinking-view collapse|expand` collapses or expands all traces;
+  `/thinking-view default collapsed|expanded` sets what NEW traces start
+  as (default: collapsed); bare `/thinking-view` shows the current state.
+- **Thinking display**: `/thinking-view hide|show` collapses thinking
+- **Colour semantics** (2026-11-14): cyan = active (running tools, working),
+  green = success/healthy, gold = completed work/accents, amber = observation
+  worth a look (watchdog HUNG, warnings — no longer red-looking), red = real
+  failure only. Informational transcript notices are neutral; `Warn` is
+  amber, `Error` is red. Watchdog cards tint by verdict (ALIVE green,
+  JUDGING gold, HUNG amber) and update in place for identical facts.
+- **Thinking traces**: rendered as dimmed markdown (headings, bold,
+  code, lists). Click any thinking block to close it — it collapses to a
+  one-line marker with its character count; click again to reopen.
+  Tool calls work the same way: click a tool block to open the full args
+  and output, click again to collapse to the one-line form (per-block; the
+  `/tools` default is untouched). Tool blocks show formal titles ("Update
+  Tasks", "Scratchpad Write", "List Directory"); args render as key/value
+  rows — the clicked view lists every field (no raw JSON).
+  `/thinking-view collapse|expand` collapses or expands all traces;
+  `/thinking-view default collapsed|expanded` sets what NEW traces start
+  as (default: collapsed); bare `/thinking-view` shows the current state.
 - **Thinking display**: `/thinking-view hide|show` collapses thinking
   blocks to a one-line marker (char count) or shows them again. Display
   only — the model's thinking *level* remains pi's `/thinking`.
@@ -34,6 +78,16 @@
   lane — every turn routes to the best verified-FREE cloud model, the
   local engine is never selected, and the lane dies loudly (no silent
   local fallback) when no free lane fits the context.
+- **Decision trail** (`/routes`): at a glance — the latest routing
+  decisions newest-first: time, tier (local/cloud), outcome, provider/model,
+  reason (user/retry/continuation), engine state at decision time, latency,
+  tokens. The last decision also shows on the `/caduceus` Status tab as
+  `last route`. `/cost` remains the aggregate per-model view.
+- **Lane order** (2026-11-13): free-tier models come first, in catalog
+  order; the paid subscription lanes (`opencode-go`) rank after every
+  free lane. A free lane that hits its quota (429/quota response) is put
+  on cooldown and the router walks down the line; only when free lanes
+  are exhausted/cooling does it use the subscription lanes.
 - **Lane health** (`/nimbus`): caduceus marks unhealthy endpoints on its
   provider connections — `isActive=false` owners are excluded from lane
   selection before the first wasted turn, `backoffLevel>0` owners are
@@ -42,7 +96,21 @@
   marks, cooldowns, and the next pick.
 - **Autofill**: press **Tab** to cycle keyword/target completions (shown on the
   ⧉ bar under the prompt). BackTab still cycles tabs.
-- **Scroll**: **PgUp**/**PgDn** scroll the output; Up/Down recall command
+- **Scroll**: **PgUp**/**PgDn** (and the wheel) scroll the output. Scrolling
+  up **locks the view**: incoming streaming output never drags the lines
+  you are reading. A hint row above the prompt shows the lock; click it or
+  press **End** (empty input) to jump back to the live tail (the hint row
+  says "press END to go back to bottom"). **Home** jumps to the oldest
+  line; sending a message also returns to the tail.
+- **Held messages**: anything typed while the agent is busy shows above
+  the prompt as `⏳ held — steering/queued/follow-up: "…"` until the
+  agent actually reaches it (steering lands at the next step; a queued
+  message behind a running tool is delivered when the tool settles;
+  Alt+Enter follow-ups go with the next turn).
+- **Compaction**: a bordered "compacting context" banner above the prompt
+  (with spinner + elapsed) plus a live inline marker — the auto-continue
+  is signalled when the summary lands.
+- **Command recall**: Up/Down recall command
   history; Enter runs a command.
 
 ## Subscriptions via Caduceus

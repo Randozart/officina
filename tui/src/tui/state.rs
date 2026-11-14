@@ -137,6 +137,41 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "update_tasks",
 ];
 
+/// Formal display title for a tool registry name (2026-11-13, operator
+/// request: "Update Tasks" instead of "update_tasks"). Unknown names are
+/// title-cased on '_' / '-' boundaries.
+pub fn tool_display_name(name: &str) -> String {
+    let title = match name {
+        "update_tasks" => return "Update Tasks".to_string(),
+        "scratchpad_write" => return "Scratchpad Write".to_string(),
+        "scratchpad_read" => return "Scratchpad Read".to_string(),
+        "bash" => "Bash",
+        "read" => "Read",
+        "write" => "Write",
+        "edit" => "Edit",
+        "find" => "Find",
+        "grep" => "Grep",
+        "ls" => "List Directory",
+        _ => {
+            let mut out = String::with_capacity(name.len());
+            let mut cap = true;
+            for ch in name.chars() {
+                if ch == '_' || ch == '-' {
+                    out.push(' ');
+                    cap = true;
+                } else if cap {
+                    out.extend(ch.to_uppercase());
+                    cap = false;
+                } else {
+                    out.push(ch);
+                }
+            }
+            return out;
+        }
+    };
+    title.to_string()
+}
+
 // ── /help modal (owner request 2026-09-03) ───────────────────────────
 
 /// Sidebar glossary — every row explained. DRIFT GUARD (standing rule,
@@ -284,12 +319,21 @@ const NO_OUTPUT_HINT_SECS: u64 = 30;
 pub enum ChatEntry {
     User(String),
     Assistant(String),
-    Thinking(String),
+    /// Thinking block (2026-11-13): a left click toggles `collapsed`
+    /// (close/open the trace); the text survives collapse.
+    Thinking {
+        text: String,
+        collapsed: bool,
+    },
     Tool {
         tool_call_id: Option<String>,
         name: String,
         summary: String,
         args: Option<serde_json::Value>,
+        /// Click override (2026-11-14): the operator cycles
+        /// closed (line) → formatted (block) → full → closed. None follows
+        /// the /tools config until the first click.
+        click_mode: Option<ToolVerbosity>,
         output: Vec<String>,
         output_truncated: bool,
         running: bool,
@@ -307,8 +351,15 @@ pub enum ChatEntry {
         #[allow(clippy::type_complexity)]
         render_cache: Option<(usize, u64, usize, u64, Vec<Line<'static>>)>,
     },
-    /// Diagnostic notice (extension errors, retries, stderr surfacing).
+    /// Informational notice (neutral, 2026-11-14): settings/janitor/scan
+    /// reports and other ordinary output. Never rendered in the failure red.
     Diag(String),
+    /// Observation that deserves attention but is not a failure (amber):
+    /// harness watchdog aborts, budget pressure.
+    Warn(String),
+    /// Genuine failure (red): extension errors, failed commands, failed
+    /// compactions/imports.
+    Error(String),
     /// Long info-notify captured into the transcript (QoL batch stage 3,
     /// 2026-11-12): multi-line tables (/free, /nimbus, /phase-models) were
     /// invisible beyond the 40-char glance row. Neutral violet — NOT an
@@ -511,6 +562,26 @@ impl Dialog {
 }
 
 #[allow(dead_code)]
+/// A message typed while the agent is busy — shown as held until it
+/// actually enters the conversation (2026-11-13, operator request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldKind {
+    /// Screened behind a running tool; delivered as a fresh Prompt at settle.
+    Queued,
+    /// Steered into the running turn (inserted at the next step).
+    Steer,
+    /// Alt+Enter follow-up (pi queues it for after the turn).
+    FollowUp,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeldMsg {
+    pub text: String,
+    pub kind: HeldKind,
+    pub at: std::time::Instant,
+}
+
+#[derive(Debug)]
 pub struct AppState {
     pub entries: Vec<ChatEntry>,
     pub is_streaming: bool,
@@ -596,16 +667,43 @@ pub struct AppState {
     pub editor_suspend: Option<(Vec<String>, std::path::PathBuf, String)>,
     /// /cost modal (exec-infra stage 5): today's route ledger, read-only.
     pub cost_open: bool,
+    /// /routes modal — Caduceus decision trail (2026-11-13, operator
+    /// request: see routing decisions at a glance).
+    pub routes: Option<crate::tui::routes::RouteReport>,
+    pub routes_open: bool,
+    pub routes_sel: usize,
     pub cost: Option<crate::tui::cost::CostReport>,
     /// Turn clock (2026-11-13): stamped when streaming starts, cleared when
     /// it settles — drives the "working… Ns" readouts.
     pub turn_started_at: Option<std::time::Instant>,
+    /// Question panel (2026-11-13): the ask extension stages question.json;
+    /// the TUI renders it on top of the prompt and writes the response.
+    pub question: Option<crate::tui::question::QuestionDoc>,
+    pub question_sel: usize,
+    pub question_checked_at: Option<std::time::Instant>,
     /// Safe-quit arm (2026-11-13): when a turn/tool is in flight, the first
     /// quit press arms a 5 s confirm window instead of killing the work.
     pub quit_armed_at: Option<std::time::Instant>,
     /// Thinking display (2026-11-13): hide thinking blocks behind a collapsed
     /// marker line; persisted at ~/.vitriol/officina/tui-thinking.
     pub hide_thinking: bool,
+    /// Default collapsed state for NEW thinking blocks (2026-11-13,
+    /// operator request — default is collapsed). Persisted at
+    /// ~/.vitriol/officina/tui-thinking-default.
+    pub thinking_default_collapsed: bool,
+    /// Injectable default-prefs path (tests must never write the
+    /// operator's live file).
+    pub thinking_default_file: Option<std::path::PathBuf>,
+    /// Line → entry map of the last chat_lines output. The renderer also
+    /// derives clickable thinking-block row ranges from it (2026-11-13).
+    pub line_entries: Vec<usize>,
+    /// Visible thinking blocks as screen rows: (y0, y1, entry idx).
+    /// Filled by layout each frame; a left click inside a range toggles
+    /// the block's collapsed state (2026-11-13).
+    pub thinking_hitboxes: Vec<(u16, u16, usize)>,
+    /// Visible tool blocks as screen rows: (y0, y1, entry idx). A left
+    /// click toggles collapsed ⇄ full args/output (2026-11-13).
+    pub tool_hitboxes: Vec<(u16, u16, usize)>,
     /// Latest structured watchdog facts (card + countdown).
     pub watchdog: Option<WatchdogDoc>,
     /// Injectable watchdog facts path (tests must never read the
@@ -741,6 +839,11 @@ pub struct AppState {
     /// the turn settles instead of being sent as RPC `Steer` behind a tool
     /// that may never finish (and would then never be persisted).
     pub queued_prompts: Vec<String>,
+    /// Messages typed while busy, visible above the prompt until the
+    /// agent actually reaches them (2026-11-13, operator request).
+    pub held: Vec<HeldMsg>,
+    /// Compaction start (drives the prominent banner's timer).
+    pub compaction_started_at: Option<std::time::Instant>,
     /// Tool calls announced by the assistant turn but not yet observed via
     /// `tool_execution_start`. Covers the failure where pi persists the
     /// assistant tool call and then never starts the tool (the TUI otherwise
@@ -755,6 +858,16 @@ pub struct AppState {
     /// Chat viewport of the last rendered frame — lets handle_key map
     /// selection rows to transcript lines without a Frame.
     pub last_chat_area: Option<ratatui::layout::Rect>,
+    /// Scroll lock (2026-11-13, operator request): while scrolled back the
+    /// view is pinned to an absolute line index so streaming output below
+    /// never drags the lines being read. None = following the tail.
+    pub scroll_lock: Option<usize>,
+    /// Line index at the top of the last rendered window (scroll_up base).
+    pub last_start: usize,
+    /// Total rendered transcript lines at the last frame.
+    pub last_chat_total: usize,
+    /// Screen rect of the "scrolled back" hint row; click jumps to tail.
+    pub tail_hint_area: Option<ratatui::layout::Rect>,
     /// Sidebar viewport of the last rendered frame — wheel events over this
     /// rect scroll the sidebar independently of the chat (2026-11-10).
     pub last_sidebar_area: Option<ratatui::layout::Rect>,
@@ -823,10 +936,18 @@ impl Default for AppState {
             review: None,
             review_sel: 0,
             cost_open: false,
+            routes: None,
+            routes_open: false,
+            routes_sel: 0,
             cost: None,
+            question: None,
+            question_sel: 0,
+            question_checked_at: None,
             turn_started_at: None,
             quit_armed_at: None,
             hide_thinking: load_hide_thinking(),
+            thinking_default_collapsed: load_thinking_default(),
+            thinking_default_file: None,
             watchdog: None,
             watchdog_file: None,
             fx_open: false,
@@ -885,10 +1006,16 @@ impl Default for AppState {
             watchdog_fired: std::collections::HashSet::new(),
             abort_deadline: None,
             queued_prompts: Vec::new(),
+            held: Vec::new(),
+            compaction_started_at: None,
             expected_tool_calls: std::collections::HashMap::new(),
             sel_anchor: None,
             sel_head: None,
             last_chat_area: None,
+            scroll_lock: None,
+            last_start: 0,
+            last_chat_total: 0,
+            tail_hint_area: None,
             last_sidebar_area: None,
             sidebar_scroll: 0,
             sidebar_scroll_max: 0,
@@ -897,6 +1024,9 @@ impl Default for AppState {
             scroll: 0,
             scroll_max: 0,
             md_cache: HashMap::new(),
+            line_entries: Vec::new(),
+            thinking_hitboxes: Vec::new(),
+            tool_hitboxes: Vec::new(),
         }
     }
 }
@@ -1781,6 +1911,21 @@ impl AppState {
             self.ctx_bar_label()
                 .unwrap_or_else(|| "— (no report yet)".to_string()),
         ));
+        let last = crate::tui::routes::load_recent(&crate::tui::routes::today(), 1);
+        rows.push((
+            "last route",
+            last.latest()
+                .map(|e| {
+                    format!(
+                        "{} · {} · {} · {}",
+                        e.tier,
+                        e.provider,
+                        e.model,
+                        crate::tui::routes::short_time(&e.ts)
+                    )
+                })
+                .unwrap_or_else(|| "— (no decisions today)".to_string()),
+        ));
         rows.push(("permissions", self.perm_mode.clone()));
         rows.push((
             "gateway",
@@ -1848,12 +1993,34 @@ impl AppState {
         // Watchdog observations are not errors — give them their own block.
         if msg.starts_with("hang-watchdog") {
             let path = self.watchdog_file.clone().unwrap_or_else(watchdog_path);
+            let prev_key = self
+                .watchdog
+                .as_ref()
+                .map(|d| format!("{}|{}", d.command, d.verdict));
             self.watchdog = load_watchdog_doc_at(&path);
-            self.entries.push(ChatEntry::Watchdog(msg.to_string()));
+            let new_key = self
+                .watchdog
+                .as_ref()
+                .map(|d| format!("{}|{}", d.command, d.verdict));
+            // Same command+verdict as the card on screen: update in place
+            // instead of stacking duplicates (2026-11-14).
+            let replace = matches!(
+                (self.entries.last(), prev_key.as_deref(), new_key.as_deref()),
+                (Some(ChatEntry::Watchdog(_)), Some(p), Some(n)) if p == n
+            );
+            if replace {
+                if let Some(ChatEntry::Watchdog(prev)) = self.entries.last_mut() {
+                    *prev = msg.to_string();
+                }
+            } else {
+                self.entries.push(ChatEntry::Watchdog(msg.to_string()));
+            }
             return;
         }
-        if ntype == "error" || ntype == "warning" {
-            self.entries.push(ChatEntry::Diag(msg.to_string()));
+        if ntype == "error" {
+            self.entries.push(ChatEntry::Error(msg.to_string()));
+        } else if ntype == "warning" {
+            self.entries.push(ChatEntry::Warn(msg.to_string()));
         } else {
             self.notice = Some((msg.to_string(), ntype.to_string()));
             if msg.contains('\n') || msg.len() > 100 {
@@ -1916,19 +2083,128 @@ impl AppState {
         self.cache_refresh();
     }
 
+    /// Collapse every thinking trace (2026-11-13, operator request).
+    pub fn thinking_collapse_all(&mut self) {
+        let mut n = 0;
+        for e in self.entries.iter_mut() {
+            if let ChatEntry::Thinking { collapsed, .. } = e {
+                if !*collapsed {
+                    *collapsed = true;
+                    n += 1;
+                }
+            }
+        }
+        self.entries.push(ChatEntry::Diag(format!(
+            "thinking: collapsed {n} trace(s) — /thinking-view expand reopens them"
+        )));
+    }
+
+    /// Expand every thinking trace.
+    pub fn thinking_expand_all(&mut self) {
+        let mut n = 0;
+        for e in self.entries.iter_mut() {
+            if let ChatEntry::Thinking { collapsed, .. } = e {
+                if *collapsed {
+                    *collapsed = false;
+                    n += 1;
+                }
+            }
+        }
+        self.entries
+            .push(ChatEntry::Diag(format!("thinking: expanded {n} trace(s)")));
+    }
+
+    /// Register a message that is held (typed while the agent is busy).
+    pub fn held_push(&mut self, text: &str, kind: HeldKind) {
+        self.held.push(HeldMsg {
+            text: text.to_string(),
+            kind,
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// Drop held messages: one kind, or all when `kind` is None.
+    pub fn held_clear(&mut self, kind: Option<HeldKind>) {
+        match kind {
+            Some(k) => self.held.retain(|h| h.kind != k),
+            None => self.held.clear(),
+        }
+    }
+
+    /// Resolve the oldest queued delivery (keeps a multi-message queue).
+    pub fn held_resolve_queued(&mut self) {
+        if let Some(pos) = self.held.iter().position(|h| h.kind == HeldKind::Queued) {
+            self.held.remove(pos);
+        }
+    }
+
+    /// One-line description of what is being held, for the prompt row.
+    pub fn held_label(&self) -> Option<String> {
+        let first = self.held.first()?;
+        let mut t = first.text.replace('\n', " ");
+        if t.chars().count() > 48 {
+            t = t.chars().take(47).collect::<String>() + "…";
+        }
+        let kind = match first.kind {
+            HeldKind::Queued => "queued",
+            HeldKind::Steer => "steering",
+            HeldKind::FollowUp => "follow-up",
+        };
+        let more = if self.held.len() > 1 {
+            format!(" (+{} more)", self.held.len() - 1)
+        } else {
+            String::new()
+        };
+        Some(format!("{kind}: “{t}”{more}"))
+    }
+
     /// `/cache` command surface. Bare opens the manager modal.
     /// `/thinking-view [hide|show]` — display-only toggle (the model's
     /// thinking LEVEL stays with pi's /thinking). Bare = status.
     pub fn thinking_view_command(&mut self, args: &str) {
         match args.trim() {
             "" => self.entries.push(ChatEntry::Diag(format!(
-                "thinking display: {} — /thinking-view hide|show",
+                "thinking display: {}; new blocks start {} — /thinking-view hide|show|collapse|expand|default",
                 if self.hide_thinking {
                     "hidden"
                 } else {
                     "shown"
+                },
+                if self.thinking_default_collapsed {
+                    "collapsed"
+                } else {
+                    "expanded"
                 }
             ))),
+            "collapse" | "collapse-all" => self.thinking_collapse_all(),
+            "expand" | "expand-all" => self.thinking_expand_all(),
+            "default" => self.entries.push(ChatEntry::Diag(format!(
+                "thinking default: {} — /thinking-view default collapsed|expanded",
+                if self.thinking_default_collapsed {
+                    "collapsed"
+                } else {
+                    "expanded"
+                }
+            ))),
+            a if a.starts_with("default ") => {
+                let v = a["default ".len()..].trim();
+                let collapsed = match v {
+                    "collapsed" | "collapse" | "hide" | "hidden" | "on" => true,
+                    "expanded" | "expand" | "show" | "shown" | "off" => false,
+                    other => {
+                        self.entries.push(ChatEntry::Diag(format!(
+                            "thinking-view: unknown default '{other}' — use collapsed | expanded"
+                        )));
+                        return;
+                    }
+                };
+                self.thinking_default_collapsed = collapsed;
+                persist_thinking_default(self);
+                self.entries.push(ChatEntry::Diag(format!(
+                    "thinking default: {} (applies to new traces)",
+                    if collapsed { "collapsed" } else { "expanded" }
+                )));
+            }
             "hide" | "hidden" | "off" => {
                 self.hide_thinking = true;
                 persist_hide_thinking(self);
@@ -1943,7 +2219,7 @@ impl AppState {
                     .push(ChatEntry::Diag("thinking display: shown".into()));
             }
             other => self.entries.push(ChatEntry::Diag(format!(
-                "thinking-view: unknown '{other}' — use hide | show"
+                "thinking-view: unknown '{other}' — use hide | show | collapse | expand | default"
             ))),
         }
     }
@@ -2052,13 +2328,68 @@ impl AppState {
     pub fn push_thinking_delta(&mut self, delta: &str) {
         self.stream_heat = (self.stream_heat + 0.4).min(1.6);
         match self.entries.last_mut() {
-            Some(ChatEntry::Thinking(t)) => t.push_str(delta),
-            _ => self.entries.push(ChatEntry::Thinking(delta.to_string())),
+            Some(ChatEntry::Thinking { text, .. }) => text.push_str(delta),
+            _ => self.entries.push(ChatEntry::Thinking {
+                text: delta.to_string(),
+                collapsed: self.thinking_default_collapsed,
+            }),
         }
+    }
+
+    /// Left-click on a thinking block: toggle it. Returns true when the
+    /// click landed on a block (2026-11-13).
+    pub fn thinking_toggle_at(&mut self, row: u16) -> bool {
+        let idx = self
+            .thinking_hitboxes
+            .iter()
+            .find(|(y0, y1, _)| row >= *y0 && row <= *y1)
+            .map(|(_, _, idx)| *idx);
+        let Some(idx) = idx else { return false };
+        if let Some(ChatEntry::Thinking { collapsed, .. }) = self.entries.get_mut(idx) {
+            *collapsed = !*collapsed;
+            return true;
+        }
+        false
+    }
+
+    /// Left-click on a tool block: cycle closed (line) → formatted (block)
+    /// → full → closed. Returns true when the click landed on a block
+    /// (2026-11-14, operator request).
+    pub fn tool_toggle_at(&mut self, row: u16) -> bool {
+        let idx = self
+            .tool_hitboxes
+            .iter()
+            .find(|(y0, y1, _)| row >= *y0 && row <= *y1)
+            .map(|(_, _, idx)| *idx);
+        let Some(idx) = idx else { return false };
+        let Some(ChatEntry::Tool {
+            name, click_mode, ..
+        }) = self.entries.get(idx)
+        else {
+            return false;
+        };
+        let current = click_mode
+            .unwrap_or_else(|| effective_mode(name, self.tool_default, &self.tool_overrides));
+        let next = current.next();
+        if let Some(ChatEntry::Tool {
+            click_mode,
+            render_cache,
+            ..
+        }) = self.entries.get_mut(idx)
+        {
+            *click_mode = Some(next);
+            // The cached block was rendered at the old verbosity.
+            *render_cache = None;
+            return true;
+        }
+        false
     }
 
     pub fn push_user(&mut self, text: String) {
         self.entries.push(ChatEntry::User(text));
+        // A new turn means the operator is looking at the prompt: release
+        // the scroll lock so the answer streams in view.
+        self.scroll_follow();
     }
 
     /// Tool execution started — add a running tool entry with full args.
@@ -2074,6 +2405,7 @@ impl AppState {
             name: name.to_string(),
             summary,
             args: Some(args.clone()),
+            click_mode: None,
             output: Vec::new(),
             output_truncated: false,
             running: true,
@@ -2436,6 +2768,76 @@ impl AppState {
     }
 
     /// Seconds since the last real signal (0 when none ever, for display).
+    /// Question panel poll (throttled to 500 ms). Loads a fresh staged
+    /// question; clears the panel when the file is consumed or expires.
+    pub fn question_poll(&mut self) {
+        let now = crate::tui::caduceus::now_ms();
+        if let Some(t) = self.question_checked_at {
+            if t.elapsed().as_millis() < 500 {
+                return;
+            }
+        }
+        self.question_checked_at = Some(std::time::Instant::now());
+        match crate::tui::question::load_fresh(now) {
+            Some(doc) => {
+                if self
+                    .question
+                    .as_ref()
+                    .map(|q| q.id != doc.id)
+                    .unwrap_or(true)
+                {
+                    self.question_sel = 0;
+                }
+                self.question = Some(doc);
+            }
+            None => self.question = None,
+        }
+    }
+
+    /// Enter on the question panel: answer the staged question.
+    pub fn question_answer(&mut self) {
+        let Some(doc) = self.question.as_ref() else {
+            return;
+        };
+        let Some(opt) = doc.options.get(self.question_sel) else {
+            return;
+        };
+        let id = doc.id.clone();
+        let answer = opt.clone();
+        if let Err(e) = crate::tui::question::write_response(&id, Some(answer)) {
+            self.entries.push(ChatEntry::Diag(format!(
+                "question: response write failed ({e})"
+            )));
+            return;
+        }
+        self.question = None;
+        self.question_sel = 0;
+    }
+
+    /// Esc on the question panel: cancel (the extension fail-opens).
+    pub fn question_cancel(&mut self) {
+        let Some(doc) = self.question.as_ref() else {
+            return;
+        };
+        let id = doc.id.clone();
+        if let Err(e) = crate::tui::question::write_response(&id, None) {
+            self.entries.push(ChatEntry::Diag(format!(
+                "question: response write failed ({e})"
+            )));
+        }
+        self.question = None;
+        self.question_sel = 0;
+    }
+
+    /// Digits 1-9 on the question panel: direct option pick.
+    pub fn question_pick(&mut self, n: usize) {
+        if self.question.is_none() {
+            return;
+        }
+        self.question_sel = n.saturating_sub(1);
+        self.question_answer();
+    }
+
     /// Seconds since the turn began (stamped when streaming starts).
     pub fn turn_elapsed_secs(&self) -> u64 {
         self.turn_started_at
@@ -2497,6 +2899,9 @@ impl AppState {
     // ── Scrollback (owner request 2026-09-02) ────────────────────────────
 
     pub fn scroll_up(&mut self, rows: u16) {
+        self.clear_selection();
+        let anchor = self.scroll_lock.unwrap_or(self.last_start);
+        self.scroll_lock = Some(anchor.saturating_sub(rows as usize));
         self.scroll = self
             .scroll
             .saturating_add(rows)
@@ -2504,7 +2909,23 @@ impl AppState {
     }
 
     pub fn scroll_down(&mut self, rows: u16) {
+        self.clear_selection();
+        if self.scroll == 0 {
+            return;
+        }
+        let anchor = self.scroll_lock.unwrap_or(self.last_start);
         self.scroll = self.scroll.saturating_sub(rows);
+        if self.scroll == 0 {
+            self.scroll_lock = None;
+        } else {
+            self.scroll_lock = Some(anchor.saturating_add(rows as usize));
+        }
+    }
+
+    /// Lock released — the view follows the tail again.
+    pub fn scroll_follow(&mut self) {
+        self.scroll = 0;
+        self.scroll_lock = None;
     }
 
     // ── Text selection (owner request 2026-09-03) ────────────────────────
@@ -2566,11 +2987,12 @@ impl AppState {
     /// Jump to the oldest visible content (renderer clamps to scroll_max).
     pub fn scroll_home(&mut self) {
         self.scroll = u16::MAX;
+        self.scroll_lock = Some(0);
     }
 
     /// Back to the live tail.
     pub fn scroll_end(&mut self) {
-        self.scroll = 0;
+        self.scroll_follow();
     }
 
     /// Sidebar has its own scrollback (owner request 2026-11-10): the panel
@@ -2616,6 +3038,7 @@ impl AppState {
             self.md_cache.clear();
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut line_entries: Vec<usize> = Vec::new();
         let total = self.entries.len();
         let mut liveness = self.liveness_suffix();
         if let Some(secs) = self.watchdog_countdown() {
@@ -2674,9 +3097,10 @@ impl AppState {
                         lines.push(Line::from(spans));
                     }
                 }
-                ChatEntry::Thinking(text) => {
-                    if self.hide_thinking {
-                        let n = text.chars().count();
+                ChatEntry::Thinking { text, collapsed } => {
+                    let n = text.chars().count();
+                    let collapsed = self.hide_thinking || *collapsed;
+                    if collapsed {
                         // Liveliness (2026-11-13): while this block is the
                         // live tail and the session is streaming, the marker
                         // animates — visible proof the model is thinking,
@@ -2698,11 +3122,16 @@ impl AppState {
                         let label = if growing {
                             "thinking…"
                         } else {
-                            "thinking hidden"
+                            "thinking collapsed"
+                        };
+                        let hint = if self.hide_thinking {
+                            "/thinking-view show"
+                        } else {
+                            "click to expand"
                         };
                         lines.push(Line::from(Span::styled(
                             format!(
-                                "  ·    {spinner}{label} ({}) — /thinking-view show",
+                                "  ·    {spinner}{label} ({}) — {hint}",
                                 if n >= 1000 {
                                     format!("{:.1}k chars", n as f64 / 1000.0)
                                 } else {
@@ -2711,18 +3140,37 @@ impl AppState {
                             ),
                             count_style,
                         )));
-                        continue;
-                    }
-                    for seg in wrap_text(text, width.saturating_sub(8)) {
-                        lines.push(Line::from(vec![
-                            Span::styled("  ·    ", Style::default().fg(theme::MUTED)),
-                            Span::styled(
-                                seg,
-                                Style::default()
-                                    .fg(theme::MUTED)
-                                    .add_modifier(ratatui::style::Modifier::ITALIC),
-                            ),
-                        ]));
+                    } else {
+                        // Markdown-formatted thinking (2026-11-13, operator
+                        // request): same renderer + cache as assistant
+                        // replies, dimmed italic so it still reads as
+                        // reasoning rather than output. Click to close.
+                        let key = (idx, n, width);
+                        let md = if let Some(cached) = self.md_cache.get(&key) {
+                            cached.clone()
+                        } else {
+                            let rendered = crate::markdown::render(text, width.saturating_sub(8));
+                            self.md_cache.insert(key, rendered.clone());
+                            rendered
+                        };
+                        let mut first = true;
+                        for ml in md {
+                            let mut spans: Vec<Span> = Vec::with_capacity(ml.spans.len() + 1);
+                            spans.push(Span::styled(
+                                if first { "  ·    " } else { "        " },
+                                Style::default().fg(theme::MUTED),
+                            ));
+                            for sp in ml.spans {
+                                spans.push(Span::styled(
+                                    sp.content,
+                                    sp.style
+                                        .fg(theme::MUTED)
+                                        .add_modifier(ratatui::style::Modifier::ITALIC),
+                                ));
+                            }
+                            lines.push(Line::from(spans));
+                            first = false;
+                        }
                     }
                 }
                 ChatEntry::Tool {
@@ -2736,14 +3184,18 @@ impl AppState {
                     started_at,
                     timeout_s,
                     render_cache,
+                    click_mode,
                     ..
                 } => {
-                    let mode = effective_mode(name, self.tool_default, &self.tool_overrides);
+                    // Click override wins over /tools config (2026-11-14).
+                    let mode = click_mode.unwrap_or_else(|| {
+                        effective_mode(name, self.tool_default, &self.tool_overrides)
+                    });
                     if mode == ToolVerbosity::Line {
                         // Collapsed single line — the status-quo rendering,
                         // byte-identical to pre-verbosity builds.
                         let (icon, st) = if *running {
-                            (theme::GLYPH_CRUCIBLE, theme::warn())
+                            (theme::GLYPH_CRUCIBLE, theme::live())
                         } else if *error {
                             ("✗", theme::crit())
                         } else {
@@ -2755,11 +3207,12 @@ impl AppState {
                             // title and command must be different colors).
                             let budget = width.saturating_sub(8);
                             let title_s = trunc_str(title, 40);
-                            let used = name.chars().count() + 3 + title_s.chars().count() + 3;
+                            let display = tool_display_name(name);
+                            let used = display.chars().count() + 3 + title_s.chars().count() + 3;
                             let cmd_s = trunc_str(&cmd, budget.saturating_sub(used));
                             let mut spans = vec![
                                 Span::styled(format!("  {} ", icon), st),
-                                Span::styled(name.clone(), st),
+                                Span::styled(display, st),
                                 Span::styled(
                                     " ▸ ",
                                     Style::default().fg(theme::MUTED).bg(theme::BG),
@@ -2781,10 +3234,11 @@ impl AppState {
                             }
                             lines.push(Line::from(spans));
                         } else {
+                            let display = tool_display_name(name);
                             let body = if summary.is_empty() {
-                                name.clone()
+                                display
                             } else {
-                                format!("{} {}", name, summary)
+                                format!("{} {}", display, summary)
                             };
                             for (i, seg) in wrap_text(&body, width.saturating_sub(8))
                                 .into_iter()
@@ -2852,14 +3306,55 @@ impl AppState {
                     }
                 }
                 ChatEntry::Diag(text) => {
-                    let st = theme::crit();
+                    // Neutral voice (2026-11-14): diagnostics are info, not
+                    // errors — red is reserved for ChatEntry::Error.
+                    let st = Style::new().fg(theme::SILVER).bg(theme::BG);
+                    let glyph = Style::new().fg(theme::MUTED).bg(theme::BG);
                     for (i, seg) in wrap_text(text, width.saturating_sub(8))
                         .into_iter()
                         .enumerate()
                     {
                         if i == 0 {
                             lines.push(Line::from(vec![
-                                Span::styled(format!("  {} ", theme::GLYPH_SULFUR), st),
+                                Span::styled(format!("  {} ", theme::GLYPH_SULFUR), glyph),
+                                Span::styled(seg, st),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::raw("        "),
+                                Span::styled(seg, st),
+                            ]));
+                        }
+                    }
+                }
+                ChatEntry::Warn(text) => {
+                    let st = Style::new().fg(theme::ORANGE).bg(theme::BG);
+                    for (i, seg) in wrap_text(text, width.saturating_sub(8))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if i == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled("  \u{26a0} ", st),
+                                Span::styled(seg, st),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::raw("        "),
+                                Span::styled(seg, st),
+                            ]));
+                        }
+                    }
+                }
+                ChatEntry::Error(text) => {
+                    let st = Style::new().fg(theme::RED).bg(theme::BG);
+                    for (i, seg) in wrap_text(text, width.saturating_sub(8))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if i == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled("  \u{2717} ", st),
                                 Span::styled(seg, st),
                             ]));
                         } else {
@@ -2892,7 +3387,8 @@ impl AppState {
                 ChatEntry::Watchdog(text) => {
                     // Structured card when the facts file is fresh; raw text
                     // fallback so a message is never lost (I3).
-                    let edge = Style::new().fg(theme::ORANGE).bg(theme::BG);
+                    let edge_color = watchdog_edge_color(wd.as_ref().map(|d| d.verdict.as_str()));
+                    let edge = Style::new().fg(edge_color).bg(theme::BG);
                     let body = Style::new().fg(theme::TEXT).bg(theme::BG);
                     let muted = Style::new().fg(theme::MUTED).bg(theme::BG);
                     let span_w = width.saturating_sub(4) as usize;
@@ -2933,7 +3429,7 @@ impl AppState {
                         Span::styled(
                             label,
                             Style::new()
-                                .fg(theme::ORANGE)
+                                .fg(edge_color)
                                 .bg(theme::BG)
                                 .add_modifier(Modifier::BOLD),
                         ),
@@ -3001,7 +3497,11 @@ impl AppState {
                     lines.push(Line::from(""));
                 }
             }
+            for _ in before..lines.len() {
+                line_entries.push(idx);
+            }
         }
+        self.line_entries = line_entries;
         lines
     }
 
@@ -3011,6 +3511,7 @@ impl AppState {
     /// Shorts stay ≤ ~40 cols; longs carry the full usage.
     pub const LOCAL_COMMANDS: &[(&str, &str, &str)] = &[
         ("cost", "routing ledger", "/cost — today's route ledger: requests, tokens in/out, failures per provider/model + budget bars (read-only)"),
+        ("routes", "caduceus decisions", "/routes — the latest routing decisions: tier, provider, model, reason, local state, latency, outcome (newest first; read-only)"),
         ("sessions", "all projects", "/sessions — search + resume sessions across every project store (foreign projects are read-only hints; I4)"),
         ("review-findings", "review results", "/review-findings — the last /review findings, severity-sorted (read-only; written by /review)"),
         ("janitor", "stale cache cleanup", "/janitor [dry] — remove stale prompt/watchdog/longjob/probe/KV/session-chain artifacts (protected: newest store file, slot0.bin, corrupt quarantines, ledgers); auto-runs daily"),
@@ -3604,6 +4105,7 @@ fn diff_line_style(line: &str, default: Style) -> Style {
 /// JSON, arrays collapse to a comma list or "[N items]". Max 6 rows.
 fn generic_args_lines(
     args: &serde_json::Value,
+    full: bool,
     width: usize,
     surf: ratatui::style::Color,
     muted_st: Style,
@@ -3625,7 +4127,8 @@ fn generic_args_lines(
         if v.is_null() || (v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)) {
             continue;
         }
-        if shown >= 6 {
+        // Block preview caps the list; the full (clicked) view shows all.
+        if !full && shown >= 6 {
             let rest = obj.len().saturating_sub(shown);
             if rest > 0 {
                 lines.push(Line::from(vec![
@@ -3640,17 +4143,18 @@ fn generic_args_lines(
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
             serde_json::Value::Array(items) => {
+                let cap = if full { items.len() } else { 6 };
                 let parts: Vec<String> = items
                     .iter()
-                    .take(6)
+                    .take(cap)
                     .map(|i| match i {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     })
                     .collect();
                 let joined = parts.join(", ");
-                if items.len() > 6 {
-                    format!("{joined}, … (+{} more)", items.len() - 6)
+                if items.len() > cap {
+                    format!("{joined}, … (+{} more)", items.len() - cap)
                 } else {
                     joined
                 }
@@ -3705,14 +4209,14 @@ fn render_tool_block(
                 Style::default().fg(theme::GOLD).bg(surf),
             ),
             Span::styled(
-                name.to_string(),
+                tool_display_name(name),
                 Style::default()
                     .fg(theme::SILVER)
                     .bg(surf)
                     .add_modifier(ratatui::style::Modifier::BOLD),
             ),
         ];
-        let head_w = width.saturating_sub(6 + name.chars().count());
+        let head_w = width.saturating_sub(6 + tool_display_name(name).chars().count());
         if let Some((title, cmd)) = bash_title_and_cmd(name, args) {
             if head_w > 4 {
                 let budget = head_w.saturating_sub(3);
@@ -3745,22 +4249,17 @@ fn render_tool_block(
     if let Some(a) = args.filter(|a| !a.is_null()) {
         if let Some(special) = special_tool_args(name, a, full, width, surf) {
             lines.extend(special);
-        } else if full {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", border),
-                Span::styled("args", muted_st),
-            ]));
-            if let Ok(pretty) = serde_json::to_string_pretty(a) {
-                for pl in pretty.lines() {
-                    let mut spans = vec![Span::styled("│   ", border)];
-                    spans.extend(json_line_spans(pl, width.saturating_sub(4)));
-                    lines.push(Line::from(spans));
-                }
-            }
         } else {
             // Generic tools: key/value lines instead of a raw JSON blob
-            // (owner request 2026-11-13).
-            lines.extend(generic_args_lines(a, width, surf, muted_st, text_st));
+            // (owner request 2026-11-13) — full mode lists every field,
+            // the block preview caps at six.
+            if full {
+                lines.push(Line::from(vec![
+                    Span::styled("│ ", border),
+                    Span::styled("args", muted_st),
+                ]));
+            }
+            lines.extend(generic_args_lines(a, full, width, surf, muted_st, text_st));
         }
     }
 
@@ -3821,15 +4320,12 @@ fn render_tool_block(
     } else if running {
         let mut spans = vec![
             Span::styled("│ ", border),
-            Span::styled(
-                "running…",
-                Style::default().fg(theme::LIGHT_YELLOW).bg(surf),
-            ),
+            Span::styled("running…", Style::default().fg(theme::CYAN).bg(surf)),
         ];
         if let Some(secs) = elapsed {
             spans.push(Span::styled(
                 format!(" {}", fmt_elapsed(secs)),
-                Style::default().fg(theme::ORANGE).bg(surf),
+                Style::default().fg(theme::MUTED).bg(surf),
             ));
         }
         // Liveness evidence (2026-11-12): real CPU from pi's subprocess
@@ -3865,7 +4361,7 @@ fn render_tool_block(
             (
                 theme::GLYPH_CRUCIBLE,
                 " running",
-                Style::default().fg(theme::ORANGE).bg(surf),
+                Style::default().fg(theme::CYAN).bg(surf),
             )
         } else if error {
             ("✗", " failed", Style::default().fg(theme::RED).bg(surf))
@@ -3918,29 +4414,6 @@ fn fmt_elapsed(total: u64) -> String {
 
 /// Pretty-JSON line colorized into spans: `"key":` cyan, braces muted,
 /// scalar values text-colored. Truncated to `width` chars.
-fn json_line_spans(line: &str, width: usize) -> Vec<Span<'static>> {
-    let surf = theme::PANEL;
-    let t = trunc_str(line, width);
-    let trimmed = t.trim_start();
-    let brace = trimmed == "{" || trimmed == "}" || trimmed == "},";
-    if brace {
-        return vec![Span::styled(t, Style::default().fg(theme::MUTED).bg(surf))];
-    }
-    if let Some(pos) = t.find("\":") {
-        let split = pos + 2; // include the colon
-        return vec![
-            Span::styled(
-                t[..split].to_string(),
-                Style::default().fg(theme::CYAN).bg(surf),
-            ),
-            Span::styled(
-                t[split..].to_string(),
-                Style::default().fg(theme::TEXT).bg(surf),
-            ),
-        ];
-    }
-    vec![Span::styled(t, Style::default().fg(theme::TEXT).bg(surf))]
-}
 
 /// Char-count truncation with ellipsis.
 fn trunc_str(s: &str, w: usize) -> String {
@@ -4019,6 +4492,439 @@ mod tests {
     }
 
     #[test]
+    fn thinking_renders_markdown_and_maps_lines_to_entries() {
+        let mut s = AppState::default();
+        s.hide_thinking = false;
+        s.thinking_default_collapsed = false;
+        s.push_thinking_delta("**bold** reasoning and `code` here");
+        let lines = s.chat_lines(80);
+        assert!(!lines.is_empty());
+        assert_eq!(
+            s.line_entries.len(),
+            lines.len(),
+            "line→entry map must cover every rendered line"
+        );
+        assert!(s.line_entries.iter().all(|i| *i == 0));
+        let bold = lines.iter().flat_map(|l| l.spans.iter()).any(|sp| {
+            sp.content.contains("bold")
+                && sp
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+        });
+        assert!(bold, "markdown bold must survive the thinking renderer");
+        assert!(lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|sp| sp.content.contains("reasoning")));
+    }
+
+    #[test]
+    fn thinking_click_toggles_collapse_and_reopen() {
+        let mut s = AppState::default();
+        s.hide_thinking = false;
+        s.thinking_default_collapsed = false;
+        s.push_thinking_delta("line one\n\nline two");
+        let expanded = s.chat_lines(80);
+        assert!(expanded.len() > 1, "expanded block spans rows");
+        s.thinking_hitboxes = vec![(10, 12, 0)];
+        assert!(s.thinking_toggle_at(10), "click inside block toggles");
+        assert!(matches!(
+            s.entries[0],
+            ChatEntry::Thinking {
+                collapsed: true,
+                ..
+            }
+        ));
+        let collapsed = s.chat_lines(80);
+        assert_eq!(collapsed.len(), 1, "collapsed block is one marker row");
+        assert!(collapsed[0]
+            .spans
+            .iter()
+            .any(|sp| sp.content.contains("click to expand")));
+        assert_eq!(s.line_entries.len(), collapsed.len());
+        assert!(s.thinking_toggle_at(12), "click again reopens");
+        assert!(matches!(
+            s.entries[0],
+            ChatEntry::Thinking {
+                collapsed: false,
+                ..
+            }
+        ));
+        assert!(
+            !s.thinking_toggle_at(99),
+            "click outside all blocks is a miss"
+        );
+    }
+
+    #[test]
+    fn thinking_hidden_still_maps_lines_to_entries() {
+        let mut s = AppState::default();
+        s.hide_thinking = true;
+        s.push_thinking_delta("hidden reasoning");
+        s.push_user("hello".into());
+        let lines = s.chat_lines(80);
+        assert_eq!(s.line_entries.len(), lines.len());
+        assert!(
+            s.line_entries.iter().any(|i| *i == 0),
+            "hidden thinking marker maps to its entry (plus the blank)"
+        );
+        assert!(s.line_entries.iter().any(|i| *i == 1));
+    }
+
+    #[test]
+    fn scroll_lock_freezes_the_view_and_releases_at_the_tail() {
+        let mut s = AppState::default();
+        s.last_start = 100;
+        s.last_chat_total = 200;
+        s.scroll_max = 120;
+        s.scroll_up(5);
+        assert_eq!(s.scroll_lock, Some(95), "lock pins the top line");
+        assert_eq!(s.scroll, 5);
+        // New output arrives: total grows, but the lock is untouched.
+        s.last_chat_total = 260;
+        assert_eq!(
+            s.scroll_lock,
+            Some(95),
+            "streaming never moves a locked view"
+        );
+        s.scroll_down(5);
+        assert_eq!(s.scroll, 0);
+        assert_eq!(s.scroll_lock, None, "reaching the tail re-engages follow");
+        s.scroll_up(3);
+        s.scroll_home();
+        assert_eq!(s.scroll_lock, Some(0), "Home jumps to the oldest line");
+        s.scroll_end();
+        assert_eq!(s.scroll_lock, None);
+        assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn new_user_turn_releases_the_scroll_lock() {
+        let mut s = AppState::default();
+        s.last_start = 40;
+        s.scroll_max = 80;
+        s.scroll_up(4);
+        assert!(s.scroll_lock.is_some());
+        s.push_user("hello".into());
+        assert_eq!(s.scroll_lock, None);
+        assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn thinking_default_collapsed_applies_to_new_blocks_and_is_configurable() {
+        let mut s = AppState::default();
+        s.hide_thinking = false;
+        s.thinking_default_collapsed = true;
+        s.push_thinking_delta("first block");
+        assert!(matches!(
+            s.entries[0],
+            ChatEntry::Thinking {
+                collapsed: true,
+                ..
+            }
+        ));
+        // New block after an assistant entry also starts collapsed.
+        s.push_text_delta("answer");
+        s.push_thinking_delta("second block");
+        assert!(matches!(
+            s.entries.last(),
+            Some(ChatEntry::Thinking {
+                collapsed: true,
+                ..
+            })
+        ));
+        let dir = std::env::temp_dir().join(format!("thinking-default-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        s.thinking_default_file = Some(dir.join("tui-thinking-default"));
+        s.thinking_view_command("default expanded");
+        assert!(!s.thinking_default_collapsed);
+        let raw = std::fs::read_to_string(dir.join("tui-thinking-default")).unwrap();
+        assert_eq!(raw.trim(), "expanded");
+        s.push_thinking_delta("third block");
+        assert!(matches!(
+            s.entries.last(),
+            Some(ChatEntry::Thinking {
+                collapsed: false,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thinking_collapse_and_expand_all_commands() {
+        let mut s = AppState::default();
+        s.hide_thinking = false;
+        s.thinking_default_collapsed = false;
+        s.push_thinking_delta("one");
+        s.push_text_delta("mid");
+        s.push_thinking_delta("two");
+        s.thinking_view_command("collapse");
+        assert!(s
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ChatEntry::Thinking { .. }))
+            .all(|e| matches!(
+                e,
+                ChatEntry::Thinking {
+                    collapsed: true,
+                    ..
+                }
+            )));
+        s.thinking_view_command("expand");
+        assert!(s
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ChatEntry::Thinking { .. }))
+            .all(|e| matches!(
+                e,
+                ChatEntry::Thinking {
+                    collapsed: false,
+                    ..
+                }
+            )));
+        s.thinking_view_command("collapse-all");
+        assert!(s
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ChatEntry::Thinking { .. }))
+            .all(|e| matches!(
+                e,
+                ChatEntry::Thinking {
+                    collapsed: true,
+                    ..
+                }
+            )));
+    }
+
+    #[test]
+    fn tool_click_cycles_closed_formatted_full() {
+        let mut s = AppState::default();
+        s.hide_thinking = false;
+        s.thinking_default_collapsed = false;
+        s.tool_start(
+            Some("t1"),
+            "bash",
+            &serde_json::json!({"command": "brievc build c4probe.bv --verify-bodies", "timeout": 240}),
+        );
+        s.tool_update(Some("t1"), "bash", "compiling\n");
+        let closed = s.chat_lines(100);
+        assert_eq!(s.line_entries.len(), closed.len());
+        assert!(matches!(
+            s.entries[0],
+            ChatEntry::Tool {
+                click_mode: None,
+                ..
+            }
+        ));
+        s.tool_hitboxes = vec![(5, 9, 0)];
+
+        // Click 1: formatted block (bordered panel, args preview).
+        assert!(s.tool_toggle_at(5));
+        assert!(matches!(
+            s.entries[0],
+            ChatEntry::Tool {
+                click_mode: Some(ToolVerbosity::Block),
+                ..
+            }
+        ));
+        let formatted = s.chat_lines(100);
+        assert!(
+            formatted.iter().any(|l| l.to_string().contains('╭')),
+            "formatted state renders the bordered block"
+        );
+
+        // Click 2: full (same block, every field / full output).
+        assert!(s.tool_toggle_at(5));
+        assert!(matches!(
+            s.entries[0],
+            ChatEntry::Tool {
+                click_mode: Some(ToolVerbosity::Full),
+                ..
+            }
+        ));
+        let full = s.chat_lines(100);
+        assert!(full.len() >= formatted.len());
+
+        // Click 3: closed again (single status line).
+        assert!(s.tool_toggle_at(5));
+        assert!(matches!(
+            s.entries[0],
+            ChatEntry::Tool {
+                click_mode: Some(ToolVerbosity::Line),
+                ..
+            }
+        ));
+        let line = s.chat_lines(100);
+        assert_eq!(line.len(), closed.len(), "closed is one line again");
+        assert!(!s.tool_toggle_at(99), "click outside all blocks is a miss");
+    }
+
+    #[test]
+    fn tool_and_thinking_hitboxes_are_separate() {
+        let mut s = AppState::default();
+        s.hide_thinking = false;
+        s.thinking_default_collapsed = false;
+        s.push_thinking_delta("reasoning");
+        s.tool_start(Some("t1"), "read", &serde_json::json!({"path": "/tmp/x"}));
+        let lines = s.chat_lines(80);
+        assert_eq!(s.line_entries.len(), lines.len());
+        s.thinking_hitboxes = vec![(0, 0, 0)];
+        s.tool_hitboxes = vec![(1, 2, 1)];
+        assert!(s.thinking_toggle_at(0));
+        assert!(!s.tool_toggle_at(0), "row 0 is the thinking block");
+        assert!(s.tool_toggle_at(1));
+        assert!(matches!(
+            s.entries[0],
+            ChatEntry::Thinking {
+                collapsed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            s.entries[1],
+            ChatEntry::Tool {
+                click_mode: Some(ToolVerbosity::Block),
+                ..
+            }
+        ));
+    }
+
+    fn flat_colors(lines: &[Line]) -> Vec<ratatui::style::Color> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|sp| sp.style.fg)
+            .collect()
+    }
+
+    #[test]
+    fn running_tool_is_cyan_never_red() {
+        let mut s = AppState::default();
+        s.tool_start(
+            Some("t1"),
+            "bash",
+            &serde_json::json!({"command": "sleep 5"}),
+        );
+        let lines = s.chat_lines(100);
+        let colors = flat_colors(&lines);
+        assert!(
+            colors.contains(&theme::CYAN),
+            "running uses cyan: {colors:?}"
+        );
+        assert!(!colors.contains(&theme::RED), "running is never red");
+        assert!(
+            !colors.contains(&theme::ORANGE),
+            "running is not amber either"
+        );
+        // Completed → green; failed → red.
+        s.tool_end(Some("t1"), "bash", "done", false);
+        let done: Vec<Line> = s.chat_lines(100);
+        assert!(flat_colors(&done).contains(&theme::GREEN));
+        let mut f = AppState::default();
+        f.tool_start(Some("t2"), "bash", &serde_json::json!({"command": "false"}));
+        f.tool_end(Some("t2"), "bash", "exit 1", true);
+        let failed: Vec<Line> = f.chat_lines(100);
+        assert!(flat_colors(&failed).contains(&theme::RED));
+    }
+
+    #[test]
+    fn severity_entries_render_neutral_amber_red() {
+        let mut s = AppState::default();
+        s.entries
+            .push(ChatEntry::Diag("janitor: nothing stale".into()));
+        let diag = s.chat_lines(90);
+        assert!(!flat_colors(&diag).contains(&theme::RED), "Diag never red");
+        assert!(
+            !flat_colors(&diag).contains(&theme::ORANGE),
+            "Diag not amber"
+        );
+        s.entries.clear();
+        s.entries.push(ChatEntry::Warn("watchdog abort".into()));
+        let warn = s.chat_lines(90);
+        assert!(flat_colors(&warn).contains(&theme::ORANGE));
+        assert!(!flat_colors(&warn).contains(&theme::RED));
+        s.entries.clear();
+        s.entries.push(ChatEntry::Error("checkpoint failed".into()));
+        let err = s.chat_lines(90);
+        assert!(flat_colors(&err).contains(&theme::RED));
+        s.entries.clear();
+    }
+
+    #[test]
+    fn watchdog_edge_follows_the_verdict() {
+        assert_eq!(watchdog_edge_color(Some("ALIVE")), theme::GREEN);
+        assert_eq!(watchdog_edge_color(Some("JUDGING")), theme::GOLD);
+        assert_eq!(watchdog_edge_color(Some("HUNG")), theme::ORANGE);
+        assert_eq!(watchdog_edge_color(Some("?")), theme::MUTED);
+        assert_eq!(watchdog_edge_color(None), theme::MUTED);
+        // ALIVE must never wear the warning/failure hue (I3).
+        let mut s = AppState::default();
+        s.entries
+            .push(ChatEntry::Watchdog("hang-watchdog ALIVE".into()));
+        s.watchdog = Some(WatchdogDoc {
+            version: 1,
+            ts: crate::tui::caduceus::now_ms(),
+            kind: "verdict".into(),
+            command: "brievc build".into(),
+            elapsed_s: 60,
+            stalled_s: 0,
+            verdict: "ALIVE".into(),
+            reason: "compiling".into(),
+            next_check_at: 0,
+            phase: "watch".into(),
+        });
+        let lines = s.chat_lines(90);
+        let colors = flat_colors(&lines);
+        assert!(colors.contains(&theme::GREEN));
+        assert!(!colors.contains(&theme::ORANGE), "ALIVE card is not amber");
+        assert!(!colors.contains(&theme::RED), "ALIVE card is not red");
+    }
+
+    #[test]
+    fn watchdog_cards_update_in_place_for_identical_facts() {
+        let dir = std::env::temp_dir().join(format!("wd-dedupe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("watchdog.json");
+        let now = crate::tui::caduceus::now_ms();
+        let doc = |verdict: &str, reason: &str| {
+            format!(
+                r#"{{"version":1,"ts":{now},"kind":"verdict","command":"brievc build",
+                     "elapsed_s":60,"stalled_s":10,"verdict":"{verdict}",
+                     "reason":"{reason}","next_check_at":0,"phase":"watch"}}"#
+            )
+        };
+        std::fs::write(&path, doc("ALIVE", "working")).unwrap();
+        let mut s = AppState::default();
+        s.watchdog_file = Some(path.clone());
+        s.apply_notify("hang-watchdog: alive check 1", "info");
+        s.apply_notify("hang-watchdog: alive check 2", "info");
+        let cards = s
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ChatEntry::Watchdog(_)))
+            .count();
+        assert_eq!(cards, 1, "identical facts replace the card");
+        if let Some(ChatEntry::Watchdog(t)) = s.entries.last() {
+            assert!(t.contains("alive check 2"), "card carries the latest text");
+        } else {
+            panic!("expected a watchdog card");
+        }
+        // Different verdict is a new observation → new card.
+        std::fs::write(&path, doc("HUNG", "waiting on stdin")).unwrap();
+        s.apply_notify("hang-watchdog: now hung", "warning");
+        assert_eq!(
+            s.entries
+                .iter()
+                .filter(|e| matches!(e, ChatEntry::Watchdog(_)))
+                .count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn notify_info_short_stays_transient() {
         let mut s = AppState::default();
         s.apply_notify("coupled: Lapis Occultus", "info");
@@ -4030,13 +4936,13 @@ mod tests {
     }
 
     #[test]
-    fn notify_warning_and_error_land_as_diag() {
+    fn notify_severity_maps_to_warn_and_error() {
         let mut s = AppState::default();
         s.apply_notify("engine down", "warning");
         s.apply_notify("checkpoint failed", "error");
         assert_eq!(s.entries.len(), 2);
-        assert!(matches!(s.entries[0], ChatEntry::Diag(_)));
-        assert!(matches!(s.entries[1], ChatEntry::Diag(_)));
+        assert!(matches!(s.entries[0], ChatEntry::Warn(_)));
+        assert!(matches!(s.entries[1], ChatEntry::Error(_)));
         assert!(s.notice.is_none(), "errors do not use the glance row");
     }
 
@@ -4140,10 +5046,10 @@ mod tests {
             s.notice.is_none(),
             "watchdog entries do not use the glance row"
         );
-        // normal warnings still become Diag
+        // normal warnings become Warn (amber), not Diag or Watchdog
         let mut s2 = AppState::default();
         s2.apply_notify("engine down", "warning");
-        assert!(matches!(s2.entries[0], ChatEntry::Diag(_)));
+        assert!(matches!(s2.entries[0], ChatEntry::Warn(_)));
         // the block renders with its label
         let text = s
             .chat_lines(80)
@@ -4355,7 +5261,7 @@ mod tests {
             "empty": null,
             "blank": ""
         });
-        let lines = generic_args_lines(&args, 80, theme::PANEL, muted, base);
+        let lines = generic_args_lines(&args, false, 80, theme::PANEL, muted, base);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -4371,6 +5277,68 @@ mod tests {
         assert!(text.contains(r#"{"k":1}"#));
         assert!(!text.contains("null"), "nulls skipped: {text}");
         assert!(!text.contains(r#""path":"#), "no JSON key quoting: {text}");
+
+        // Clicked (full) view: every field, no six-key cap, arrays opened up.
+        let many = serde_json::json!({
+            "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8,
+            "items": ["x", "y", "z", "w", "v", "u", "t", "s"]
+        });
+        let full = generic_args_lines(&many, true, 120, theme::PANEL, muted, base)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for k in ["a", "h"] {
+            assert!(full.contains(k), "full lists {k}: {full}");
+        }
+        assert!(full.contains("items"), "full lists arrays: {full}");
+        assert!(full.contains('s'), "arrays uncapped in full: {full}");
+        let preview = generic_args_lines(&many, false, 120, theme::PANEL, muted, base)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            preview.contains("more"),
+            "preview caps with a count: {preview}"
+        );
+    }
+
+    #[test]
+    fn tool_display_titles_format_registry_names() {
+        assert_eq!(tool_display_name("update_tasks"), "Update Tasks");
+        assert_eq!(tool_display_name("scratchpad_write"), "Scratchpad Write");
+        assert_eq!(tool_display_name("bash"), "Bash");
+        assert_eq!(tool_display_name("ls"), "List Directory");
+        assert_eq!(tool_display_name("some_custom_tool"), "Some Custom Tool");
+        assert_eq!(tool_display_name("kebab-tool"), "Kebab Tool");
+    }
+
+    #[test]
+    fn unknown_tool_block_shows_titles_and_key_values_not_json() {
+        let mut s = AppState::default();
+        s.tool_start(
+            Some("t1"),
+            "custom_fetch",
+            &serde_json::json!({"url": "https://example.com", "headers": {"a": "b"}}),
+        );
+        s.tool_end(Some("t1"), "custom_fetch", "done", false);
+        s.tool_overrides.insert(
+            "custom_fetch".to_string(),
+            ToolOverride {
+                mode: ToolVerbosity::Block,
+                strictness: Strictness::Pinned,
+            },
+        );
+        let text = s
+            .chat_lines(110)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Custom Fetch"), "formal title: {text}");
+        assert!(text.contains("url"), "key/value rows: {text}");
+        assert!(!text.contains("\"url\":"), "no raw JSON: {text}");
     }
 
     #[test]
@@ -4896,7 +5864,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("✓"), "done icon present: {}", text);
-        assert!(text.contains("write"), "name present: {}", text);
+        assert!(text.contains("Write"), "formal title present: {}", text);
         assert!(text.contains("src/main.rs"), "summary present: {}", text);
         // No block furniture in Line mode.
         assert!(!text.contains('╭'), "no block border: {}", text);
@@ -4993,7 +5961,7 @@ mod tests {
     }
 
     #[test]
-    fn full_mode_shows_pretty_args() {
+    fn full_mode_shows_all_args_as_key_values() {
         let mut s = AppState::default();
         s.tool_default = ToolVerbosity::Full;
         s.tool_start(
@@ -5009,8 +5977,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("args"), "args header: {}", text);
-        assert!(text.contains("\"path\""), "pretty json key: {}", text);
-        assert!(text.contains("\"old\""), "second key: {}", text);
+        assert!(text.contains("path"), "key/value rows: {}", text);
+        assert!(text.contains("a.rs"), "value visible: {}", text);
+        assert!(text.contains("old"), "second key: {}", text);
+        assert!(!text.contains("\"path\":"), "no JSON quoting: {}", text);
     }
 
     #[test]
@@ -5539,6 +6509,17 @@ fn answer_mtime() -> Option<std::time::SystemTime> {
         .ok()
 }
 
+/// Watchdog card accent by verdict (2026-11-14, operator report): an ALIVE
+/// observation must never wear the warning/failure colour.
+pub fn watchdog_edge_color(verdict: Option<&str>) -> ratatui::style::Color {
+    match verdict {
+        Some("ALIVE") => theme::GREEN,
+        Some("HUNG") => theme::ORANGE,
+        Some("JUDGING") => theme::GOLD,
+        _ => theme::MUTED,
+    }
+}
+
 fn hide_thinking_path() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     p.push(".vitriol");
@@ -5570,6 +6551,46 @@ pub fn persist_hide_thinking(state: &AppState) {
             "{}
 ",
             if state.hide_thinking { "hide" } else { "show" }
+        ),
+    );
+}
+
+fn thinking_default_path() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    p.push(".vitriol");
+    p.push("officina");
+    p.push("tui-thinking-default");
+    p
+}
+
+/// Default collapsed state for new thinking blocks. Default = collapsed
+/// (2026-11-13, operator request).
+fn load_thinking_default() -> bool {
+    if let Ok(v) = std::env::var("OFFICINA_THINKING_DEFAULT") {
+        return !matches!(v.trim(), "expanded" | "expand" | "show" | "shown" | "off");
+    }
+    std::fs::read_to_string(thinking_default_path())
+        .map(|s| !matches!(s.trim(), "expanded" | "expand" | "show" | "shown" | "off"))
+        .unwrap_or(true)
+}
+
+pub fn persist_thinking_default(state: &AppState) {
+    let path = state
+        .thinking_default_file
+        .clone()
+        .unwrap_or_else(thinking_default_path);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        path,
+        format!(
+            "{}\n",
+            if state.thinking_default_collapsed {
+                "collapsed"
+            } else {
+                "expanded"
+            }
         ),
     );
 }
